@@ -174,7 +174,7 @@ class ProductMetrics:
     cancellations_today: int
     revenue_today: float
     stock_qty: int
-    days_remaining: int   # stock / avg_daily_orders_30d
+    days_remaining: int
 
 
 def aggregate_metrics(
@@ -184,7 +184,6 @@ def aggregate_metrics(
     report_date: datetime
 ) -> List[ProductMetrics]:
 
-    # 30-day velocity per SKU (non-cancelled orders)
     velocity: Dict[int, int] = {}
     for order in orders:
         if order.get("isCancel"):
@@ -193,7 +192,6 @@ def aggregate_metrics(
         if sku:
             velocity[sku] = velocity.get(sku, 0) + 1
 
-    # Today's metrics
     today_metrics: Dict[int, dict] = {}
 
     for order in orders:
@@ -210,7 +208,6 @@ def aggregate_metrics(
         if sku not in today_metrics:
             today_metrics[sku] = {"name": name, "orders": 0, "sales": 0, "cancellations": 0, "revenue": 0.0}
         today_metrics[sku]["orders"] += 1
-        # priceWithDisc = цена после скидки продавца, до СПП (≈ кабинет WB)
         today_metrics[sku]["revenue"] += order.get("priceWithDisc", 0)
 
     for sale in sales:
@@ -299,7 +296,6 @@ def generate_report_png(
     fig = plt.figure(figsize=(13, 15), dpi=150, facecolor="white")
     gs = fig.add_gridspec(4, 1, height_ratios=[0.8, 2.5, 3, 2], hspace=0.35)
 
-    # ── HEADER ──────────────────────────────────────────────────────────
     ax_h = fig.add_subplot(gs[0])
     ax_h.axis("off")
     ax_h.text(
@@ -313,7 +309,6 @@ def generate_report_png(
         color="white",
     )
 
-    # ── KPI CARDS ────────────────────────────────────────────────────────
     ax_k = fig.add_subplot(gs[1])
     ax_k.axis("off")
     ax_k.set_xlim(0, 4)
@@ -337,7 +332,6 @@ def generate_report_png(
                   fontsize=16, ha="center", va="center",
                   fontfamily="DejaVu Sans", color="white", fontweight="bold")
 
-    # ── TABLE ────────────────────────────────────────────────────────────
     ax_t = fig.add_subplot(gs[2])
     ax_t.axis("off")
 
@@ -386,7 +380,6 @@ def generate_report_png(
                         cell.set_text_props(color=hex_to_rgb(COLORS["warning_text"]), fontweight="bold")
             cell.set_text_props(fontfamily="DejaVu Sans")
 
-    # ── 7-DAY TREND ──────────────────────────────────────────────────────
     ax_c = fig.add_subplot(gs[3])
     x = np.arange(len(dates_7d))
     w = 0.35
@@ -442,78 +435,73 @@ async def main():
     orders, sales, remains = await fetch_all_data(WB_TOKEN, date_from)
     print(f"Got {len(orders)} orders, {len(sales)} sales, {len(remains)} SKUs in stock")
 
-    # ===== DEBUG: reportDetailByPeriod — проверяем quantity для подсчёта 56 шт =====
+    # ===== DEBUG: nmReportDetailHistory — аналитика продавца (ordersCount) =====
     yesterday = (datetime.now(MSK) - timedelta(days=1)).date()
-    print(f"\n=== DEBUG: reportDetailByPeriod for {yesterday} ===")
-
-    await asyncio.sleep(62)  # rate limit
-    report_url = "https://statistics-api.wildberries.ru/api/v5/supplier/reportDetailByPeriod"
-    report_resp = requests.get(report_url,
-        headers={"Authorization": f"Bearer {WB_TOKEN}"},
-        params={"dateFrom": yesterday.isoformat(), "dateTo": yesterday.isoformat()},
-        timeout=60)
-    print(f"Status: {report_resp.status_code}")
-
-    if report_resp.ok:
-        report_data = report_resp.json()
-        if isinstance(report_data, list) and report_data:
-            print(f"Total rows: {len(report_data)}")
-
-            # Группируем по supplier_oper_name
-            from collections import Counter
-            ops = Counter(r.get("supplier_oper_name") for r in report_data)
-            print(f"\nОперации: {dict(ops)}")
-
-            # Суммируем quantity по каждому типу операции
-            for op_name in ops:
-                rows = [r for r in report_data if r.get("supplier_oper_name") == op_name]
-                qty_sum = sum(r.get("quantity", 0) for r in rows)
-                revenue_sum = sum(r.get("retail_amount", 0) for r in rows)
-                print(f"  '{op_name}': {len(rows)} rows, quantity_sum={qty_sum}, retail_amount_sum={revenue_sum:.2f}")
-
-            # Отдельно: строки с order_dt == yesterday
-            order_rows = [r for r in report_data if r.get("order_dt") and r["order_dt"][:10] == str(yesterday)]
-            order_qty = sum(r.get("quantity", 0) for r in order_rows)
-            print(f"\norder_dt={yesterday}: {len(order_rows)} rows, quantity_sum={order_qty}")
-
-            # Отдельно: строки с sale_dt == yesterday
-            sale_rows = [r for r in report_data if r.get("sale_dt") and r["sale_dt"][:10] == str(yesterday)]
-            sale_qty = sum(r.get("quantity", 0) for r in sale_rows)
-            print(f"sale_dt={yesterday}: {len(sale_rows)} rows, quantity_sum={sale_qty}")
-
-            # Уникальные nm_id
-            nm_ids = set(r.get("nm_id") for r in report_data if r.get("nm_id"))
-            print(f"\nУникальных nm_id: {len(nm_ids)}")
-
-            # Покажем пару строк с order_dt = yesterday (если есть)
-            for r in order_rows[:3]:
-                print(f"  nm_id={r.get('nm_id')} sa_name={r.get('sa_name')} qty={r.get('quantity')} "
-                      f"retail={r.get('retail_amount')} op={r.get('supplier_oper_name')}")
-        else:
-            print(f"Empty or not list: {type(report_data)}, {str(report_data)[:300]}")
-    else:
-        print(f"Error: {report_resp.text[:300]}")
-
-    # ===== DEBUG: Content API — проверяем получение названий =====
-    print(f"\n=== DEBUG: Content API ===")
+    print(f"\n=== DEBUG: nmReportDetailHistory for {yesterday} ===")
     await asyncio.sleep(62)  # rate limit
     try:
-        content_resp = requests.post(
-            "https://content-api.wildberries.ru/content/v2/get/cards/list",
+        nm_url = f"{ANALYT_HOST}/api/v2/nm-report/detail/history"
+        nm_body = {
+            "nmIDs": [],
+            "period": {
+                "begin": f"{yesterday}T00:00:00.000Z",
+                "end": f"{yesterday}T23:59:59.000Z",
+            },
+            "timezone": "Europe/Moscow",
+            "aggregationLevel": "day",
+        }
+        nm_resp = requests.post(nm_url,
             headers={"Authorization": f"Bearer {WB_TOKEN}"},
-            json={"settings": {"cursor": {"limit": 10}, "filter": {"withPhoto": -1}}},
-            timeout=30)
-        print(f"Status: {content_resp.status_code}")
-        if content_resp.ok:
-            cdata = content_resp.json()
-            cards = cdata.get("cards", [])
-            print(f"Cards returned: {len(cards)}")
-            for c in cards[:5]:
-                print(f"  nmID={c.get('nmID')} title='{c.get('title', 'NO TITLE')[:60]}' vendor={c.get('vendorCode')}")
+            json=nm_body, timeout=60)
+        print(f"Status: {nm_resp.status_code}")
+        if nm_resp.ok:
+            nm_data = nm_resp.json()
+            print(f"Response keys: {list(nm_data.keys()) if isinstance(nm_data, dict) else type(nm_data)}")
+
+            cards = nm_data.get("data", []) if isinstance(nm_data, dict) else []
+            print(f"Cards in response: {len(cards)}")
+
+            total_orders_nm = 0
+            total_orders_sum = 0
+            total_buyouts = 0
+            total_buyouts_sum = 0
+            total_cancels_nm = 0
+
+            for card in cards:
+                history = card.get("history", [])
+                for day in history:
+                    total_orders_nm += day.get("ordersCount", 0)
+                    total_orders_sum += day.get("ordersSumRub", 0)
+                    total_buyouts += day.get("buyoutsCount", 0)
+                    total_buyouts_sum += day.get("buyoutsSumRub", 0)
+                    total_cancels_nm += day.get("cancelCount", 0)
+
+            print(f"\nИТОГО nmReportDetailHistory:")
+            print(f"  ordersCount = {total_orders_nm}  (кабинет = 56)")
+            print(f"  ordersSumRub = {total_orders_sum:.2f}  (кабинет ≈ 102,908)")
+            print(f"  buyoutsCount = {total_buyouts}")
+            print(f"  buyoutsSumRub = {total_buyouts_sum:.2f}")
+            print(f"  cancelCount = {total_cancels_nm}")
+
+            card_orders = []
+            for card in cards:
+                nm_id = card.get("nmID")
+                for day in card.get("history", []):
+                    oc = day.get("ordersCount", 0)
+                    os = day.get("ordersSumRub", 0)
+                    if oc > 0:
+                        card_orders.append((nm_id, oc, os))
+            card_orders.sort(key=lambda x: x[1], reverse=True)
+            print(f"\nТоп-5 по заказам:")
+            for nm_id, oc, os in card_orders[:5]:
+                print(f"  nmID={nm_id} orders={oc} sum={os:.2f}")
+
+            if nm_data.get("error"):
+                print(f"API error: {nm_data.get('error')}")
         else:
-            print(f"Error: {content_resp.text[:300]}")
+            print(f"Error: {nm_resp.text[:500]}")
     except Exception as e:
-        print(f"Content API error: {e}")
+        print(f"nmReportDetailHistory error: {e}")
 
     print("\n=== END DEBUG ===")
 
