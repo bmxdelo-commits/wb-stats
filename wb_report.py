@@ -75,7 +75,7 @@ def hex_to_rgb(hex_color: str) -> Tuple[float, float, float]:
 def get_orders(date_from: datetime, wb_token: str) -> List[Dict]:
     url = f"{STATS_HOST}/api/v1/supplier/orders"
     headers = {"Authorization": f"Bearer {wb_token}"}
-    params = {"dateFrom": date_from.isoformat(), "flag": 1}
+    params = {"dateFrom": date_from.isoformat(), "flag": 0}
     try:
         resp = requests.get(url, headers=headers, params=params, timeout=30)
         resp.raise_for_status()
@@ -88,7 +88,7 @@ def get_orders(date_from: datetime, wb_token: str) -> List[Dict]:
 def get_sales(date_from: datetime, wb_token: str) -> List[Dict]:
     url = f"{STATS_HOST}/api/v1/supplier/sales"
     headers = {"Authorization": f"Bearer {wb_token}"}
-    params = {"dateFrom": date_from.isoformat(), "flag": 1}
+    params = {"dateFrom": date_from.isoormat(), "flag": 0}
     try:
         resp = requests.get(url, headers=headers, params=params, timeout=30)
         resp.raise_for_status()
