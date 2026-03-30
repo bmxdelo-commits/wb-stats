@@ -204,12 +204,14 @@ def aggregate_metrics(
         if not order_date or order_date.date() != report_date.date():
             continue
         sku = order.get("nmId")
-        name = order.get("supplierArticle") or order.get("vendorCode") or f"SKU {sku}"
+        brand = (order.get("brand") or "").strip()
+        subject = (order.get("subject") or "").strip()
+        name = f"{brand} {subject}".strip() if brand or subject else (order.get("supplierArticle") or f"SKU {sku}")
         if sku not in today_metrics:
             today_metrics[sku] = {"name": name, "orders": 0, "sales": 0, "cancellations": 0, "revenue": 0.0}
         today_metrics[sku]["orders"] += 1
-        # finishedPrice = цена после всех скидок (покупатель платит эту сумму)
-        today_metrics[sku]["revenue"] += order.get("finishedPrice", 0)
+        # priceWithDisc = цена после скидки продавца, до СПП (≈ кабинет WB)
+        today_metrics[sku]["revenue"] += order.get("priceWithDisc", 0)
 
     for sale in sales:
         date_str = sale.get("date")
@@ -219,7 +221,9 @@ def aggregate_metrics(
         if not sale_date or sale_date.date() != report_date.date():
             continue
         sku = sale.get("nmId")
-        name = sale.get("supplierArticle") or sale.get("vendorCode") or f"SKU {sku}"
+        brand = (sale.get("brand") or "").strip()
+        subject = (sale.get("subject") or "").strip()
+        name = f"{brand} {subject}".strip() if brand or subject else (sale.get("supplierArticle") or f"SKU {sku}")
         if sku not in today_metrics:
             today_metrics[sku] = {"name": name, "orders": 0, "sales": 0, "cancellations": 0, "revenue": 0.0}
         today_metrics[sku]["sales"] += 1
@@ -438,56 +442,80 @@ async def main():
     orders, sales, remains = await fetch_all_data(WB_TOKEN, date_from)
     print(f"Got {len(orders)} orders, {len(sales)} sales, {len(remains)} SKUs in stock")
 
-    # DEBUG: try flag=1 for yesterday (returns all orders for that specific day)
+    # ===== DEBUG: reportDetailByPeriod — проверяем quantity для подсчёта 56 шт =====
     yesterday = (datetime.now(MSK) - timedelta(days=1)).date()
-    yesterday_dt = datetime.combine(yesterday, datetime.min.time()).replace(tzinfo=MSK)
-    print(f"\nDEBUG: Trying flag=1 for {yesterday} ...")
-    flag1_url = f"{STATS_HOST}/api/v1/supplier/orders"
-    flag1_resp = requests.get(flag1_url,
-        headers={"Authorization": f"Bearer {WB_TOKEN}"},
-        params={"dateFrom": yesterday_dt.isoformat(), "flag": 1}, timeout=30)
-    flag1_orders = flag1_resp.json() if flag1_resp.ok else []
-    print(f"DEBUG flag=1 orders for {yesterday}: {len(flag1_orders)} records")
+    print(f"\n=== DEBUG: reportDetailByPeriod for {yesterday} ===")
 
-    # Count from flag=0 data filtered by date
-    day_orders_f0 = [o for o in orders if parse_date(o.get("date")) and parse_date(o.get("date")).date() == yesterday]
-    print(f"DEBUG flag=0 orders for {yesterday}: {len(day_orders_f0)} records")
-
-    # DEBUG: try reportDetailByPeriod (financial report)
-    print(f"\nDEBUG: Trying /api/v5/supplier/reportDetailByPeriod ...")
+    await asyncio.sleep(62)  # rate limit
     report_url = "https://statistics-api.wildberries.ru/api/v5/supplier/reportDetailByPeriod"
     report_resp = requests.get(report_url,
         headers={"Authorization": f"Bearer {WB_TOKEN}"},
         params={"dateFrom": yesterday.isoformat(), "dateTo": yesterday.isoformat()},
         timeout=60)
-    print(f"DEBUG reportDetailByPeriod status: {report_resp.status_code}")
+    print(f"Status: {report_resp.status_code}")
+
     if report_resp.ok:
         report_data = report_resp.json()
-        if isinstance(report_data, list):
-            print(f"DEBUG reportDetailByPeriod: {len(report_data)} rows")
-            if report_data:
-                r = report_data[0]
-                print(f"DEBUG report first row keys: {list(r.keys())}")
-                # Show some key fields
-                for key in ['order_dt', 'sale_dt', 'quantity', 'retail_amount',
-                            'retail_price', 'commission_percent', 'supplier_oper_name',
-                            'nm_id', 'sa_name', 'ts_name', 'delivery_amount', 'return_amount']:
-                    if key in r:
-                        print(f"  {key} = {r[key]}")
-        else:
-            print(f"DEBUG reportDetailByPeriod response type: {type(report_data)}")
-            print(f"DEBUG reportDetailByPeriod: {str(report_data)[:500]}")
-    else:
-        print(f"DEBUG reportDetailByPeriod error: {report_resp.text[:300]}")
+        if isinstance(report_data, list) and report_data:
+            print(f"Total rows: {len(report_data)}")
 
-    # DEBUG: also try /api/v1/supplier/orders with flag=1 and count by warehouseName
-    if flag1_orders:
-        from collections import Counter
-        wh = Counter(o.get("warehouseName") for o in flag1_orders)
-        print(f"\nDEBUG flag=1 by warehouse: {dict(wh)}")
-        rev_disc_f1 = sum(o.get("priceWithDisc", 0) for o in flag1_orders)
-        rev_fin_f1 = sum(o.get("finishedPrice", 0) for o in flag1_orders)
-        print(f"DEBUG flag=1 revenue: priceWithDisc={rev_disc_f1:.2f} finishedPrice={rev_fin_f1:.2f}")
+            # Группируем по supplier_oper_name
+            from collections import Counter
+            ops = Counter(r.get("supplier_oper_name") for r in report_data)
+            print(f"\nОперации: {dict(ops)}")
+
+            # Суммируем quantity по каждому типу операции
+            for op_name in ops:
+                rows = [r for r in report_data if r.get("supplier_oper_name") == op_name]
+                qty_sum = sum(r.get("quantity", 0) for r in rows)
+                revenue_sum = sum(r.get("retail_amount", 0) for r in rows)
+                print(f"  '{op_name}': {len(rows)} rows, quantity_sum={qty_sum}, retail_amount_sum={revenue_sum:.2f}")
+
+            # Отдельно: строки с order_dt == yesterday
+            order_rows = [r for r in report_data if r.get("order_dt") and r["order_dt"][:10] == str(yesterday)]
+            order_qty = sum(r.get("quantity", 0) for r in order_rows)
+            print(f"\norder_dt={yesterday}: {len(order_rows)} rows, quantity_sum={order_qty}")
+
+            # Отдельно: строки с sale_dt == yesterday
+            sale_rows = [r for r in report_data if r.get("sale_dt") and r["sale_dt"][:10] == str(yesterday)]
+            sale_qty = sum(r.get("quantity", 0) for r in sale_rows)
+            print(f"sale_dt={yesterday}: {len(sale_rows)} rows, quantity_sum={sale_qty}")
+
+            # Уникальные nm_id
+            nm_ids = set(r.get("nm_id") for r in report_data if r.get("nm_id"))
+            print(f"\nУникальных nm_id: {len(nm_ids)}")
+
+            # Покажем пару строк с order_dt = yesterday (если есть)
+            for r in order_rows[:3]:
+                print(f"  nm_id={r.get('nm_id')} sa_name={r.get('sa_name')} qty={r.get('quantity')} "
+                      f"retail={r.get('retail_amount')} op={r.get('supplier_oper_name')}")
+        else:
+            print(f"Empty or not list: {type(report_data)}, {str(report_data)[:300]}")
+    else:
+        print(f"Error: {report_resp.text[:300]}")
+
+    # ===== DEBUG: Content API — проверяем получение названий =====
+    print(f"\n=== DEBUG: Content API ===")
+    await asyncio.sleep(62)  # rate limit
+    try:
+        content_resp = requests.post(
+            "https://content-api.wildberries.ru/content/v2/get/cards/list",
+            headers={"Authorization": f"Bearer {WB_TOKEN}"},
+            json={"settings": {"cursor": {"limit": 10}, "filter": {"withPhoto": -1}}},
+            timeout=30)
+        print(f"Status: {content_resp.status_code}")
+        if content_resp.ok:
+            cdata = content_resp.json()
+            cards = cdata.get("cards", [])
+            print(f"Cards returned: {len(cards)}")
+            for c in cards[:5]:
+                print(f"  nmID={c.get('nmID')} title='{c.get('title', 'NO TITLE')[:60]}' vendor={c.get('vendorCode')}")
+        else:
+            print(f"Error: {content_resp.text[:300]}")
+    except Exception as e:
+        print(f"Content API error: {e}")
+
+    print("\n=== END DEBUG ===")
 
     report_date = find_report_date(orders, sales)
     if not report_date:
