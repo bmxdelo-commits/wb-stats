@@ -124,7 +124,7 @@ async def get_warehouse_remains(wb_token: str) -> Dict[int, int]:
                 remains = data.get("data", {}).get("warehouseRemains", [])
                 result = {}
                 for item in remains:
-                    sku = item.get("nmID")
+                    sku = item.get("nmId")
                     qty = item.get("quantityFull", 0)
                     if sku:
                         result[sku] = qty
@@ -189,7 +189,7 @@ def aggregate_metrics(
     for order in orders:
         if order.get("isCancel"):
             continue
-        sku = order.get("nmID")
+        sku = order.get("nmId")
         if sku:
             velocity[sku] = velocity.get(sku, 0) + 1
 
@@ -203,8 +203,8 @@ def aggregate_metrics(
         order_date = parse_date(date_str)
         if not order_date or order_date.date() != report_date.date():
             continue
-        sku = order.get("nmID")
-        name = order.get("vendorCode", f"SKU {sku}")
+        sku = order.get("nmId")
+        name = order.get("supplierArticle") or order.get("vendorCode") or f"SKU {sku}"
         if sku not in today_metrics:
             today_metrics[sku] = {"name": name, "orders": 0, "sales": 0, "cancellations": 0, "revenue": 0.0}
         today_metrics[sku]["orders"] += 1
@@ -217,8 +217,8 @@ def aggregate_metrics(
         sale_date = parse_date(date_str)
         if not sale_date or sale_date.date() != report_date.date():
             continue
-        sku = sale.get("nmID")
-        name = sale.get("vendorCode", f"SKU {sku}")
+        sku = sale.get("nmId")
+        name = sale.get("supplierArticle") or sale.get("vendorCode") or f"SKU {sku}"
         if sku not in today_metrics:
             today_metrics[sku] = {"name": name, "orders": 0, "sales": 0, "cancellations": 0, "revenue": 0.0}
         today_metrics[sku]["sales"] += 1
@@ -318,7 +318,7 @@ def generate_report_png(
         ("Заказы",     str(orders_count),            COLORS["kpi_blue"]),
         ("Продажи",    str(sales_count),              COLORS["kpi_green"]),
         ("Отмены",     str(cancellations),            COLORS["kpi_red"]),
-        ("Выручка Br", f"{revenue:,.0f}",             COLORS["kpi_yellow"]),
+        ("Выручка ₽", f"{revenue:,.0f}",              COLORS["kpi_yellow"]),
     ]
     for idx, (label, value, color) in enumerate(kpis):
         x = idx + 0.5
@@ -336,7 +336,7 @@ def generate_report_png(
     ax_t = fig.add_subplot(gs[2])
     ax_t.axis("off")
 
-    headers = ["Артикул", "Заказов", "Продаж", "Отмен", "Выручка Br", "Остаток", "Дней"]
+    headers = ["Артикул", "Заказов", "Продаж", "Отмен", "Выручка ₽", "Остаток", "Дней"]
     table_data = []
     for m in metrics[:15]:
         days_str = str(m.days_remaining) if m.days_remaining < 9999 else "—"
@@ -450,7 +450,7 @@ async def main():
     total_cancels = sum(m.cancellations_today for m in metrics)
     total_revenue = sum(m.revenue_today for m in metrics)
 
-    print(f"Orders={total_orders} Sales={total_sales} Cancels={total_cancels} Revenue={total_revenue:.2f} Br")
+    print(f"Orders={total_orders} Sales={total_sales} Cancels={total_cancels} Revenue={total_revenue:.2f} ₽")
 
     dates_7d, orders_7d, sales_7d = get_7day_trend(orders, sales, report_date)
 
@@ -466,7 +466,7 @@ async def main():
         f"Заказы: {total_orders}\n"
         f"Продажи: {total_sales}\n"
         f"Отмены: {total_cancels}\n"
-        f"Выручка: {total_revenue:,.0f} Br"
+        f"Выручка: {total_revenue:,.0f} ₽"
     )
 
     print("Sending to Telegram ...")
