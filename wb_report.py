@@ -174,7 +174,7 @@ class ProductMetrics:
     cancellations_today: int
     revenue_today: float
     stock_qty: int
-    days_remaining: int
+    days_remaining: int   # stock / avg_daily_orders_30d
 
 
 def aggregate_metrics(
@@ -184,6 +184,7 @@ def aggregate_metrics(
     report_date: datetime
 ) -> List[ProductMetrics]:
 
+    # 30-day velocity per SKU (non-cancelled orders)
     velocity: Dict[int, int] = {}
     for order in orders:
         if order.get("isCancel"):
@@ -192,6 +193,7 @@ def aggregate_metrics(
         if sku:
             velocity[sku] = velocity.get(sku, 0) + 1
 
+    # Today's metrics
     today_metrics: Dict[int, dict] = {}
 
     for order in orders:
@@ -208,6 +210,7 @@ def aggregate_metrics(
         if sku not in today_metrics:
             today_metrics[sku] = {"name": name, "orders": 0, "sales": 0, "cancellations": 0, "revenue": 0.0}
         today_metrics[sku]["orders"] += 1
+        # priceWithDisc = цена после скидки продавца, до СПП (≈ кабинет WB)
         today_metrics[sku]["revenue"] += order.get("priceWithDisc", 0)
 
     for sale in sales:
@@ -296,6 +299,7 @@ def generate_report_png(
     fig = plt.figure(figsize=(13, 15), dpi=150, facecolor="white")
     gs = fig.add_gridspec(4, 1, height_ratios=[0.8, 2.5, 3, 2], hspace=0.35)
 
+    # ── HEADER ──────────────────────────────────────────────────────────
     ax_h = fig.add_subplot(gs[0])
     ax_h.axis("off")
     ax_h.text(
@@ -309,6 +313,7 @@ def generate_report_png(
         color="white",
     )
 
+    # ── KPI CARDS ────────────────────────────────────────────────────────
     ax_k = fig.add_subplot(gs[1])
     ax_k.axis("off")
     ax_k.set_xlim(0, 4)
@@ -332,6 +337,7 @@ def generate_report_png(
                   fontsize=16, ha="center", va="center",
                   fontfamily="DejaVu Sans", color="white", fontweight="bold")
 
+    # ── TABLE ────────────────────────────────────────────────────────────
     ax_t = fig.add_subplot(gs[2])
     ax_t.axis("off")
 
@@ -380,6 +386,7 @@ def generate_report_png(
                         cell.set_text_props(color=hex_to_rgb(COLORS["warning_text"]), fontweight="bold")
             cell.set_text_props(fontfamily="DejaVu Sans")
 
+    # ── 7-DAY TREND ──────────────────────────────────────────────────────
     ax_c = fig.add_subplot(gs[3])
     x = np.arange(len(dates_7d))
     w = 0.35
@@ -435,65 +442,108 @@ async def main():
     orders, sales, remains = await fetch_all_data(WB_TOKEN, date_from)
     print(f"Got {len(orders)} orders, {len(sales)} sales, {len(remains)} SKUs in stock")
 
-    # ===== DEBUG: nm-report — пробуем несколько путей и хостов =====
+    # ===== DEBUG: Sales Funnel (замена nm-report) =====
     yesterday = (datetime.now(MSK) - timedelta(days=1)).date()
-    print(f"\n=== DEBUG: nm-report for {yesterday} ===")
-    nm_body = {
-        "nmIDs": [],
-        "period": {
-            "begin": f"{yesterday}T00:00:00.000Z",
-            "end": f"{yesterday}T23:59:59.000Z",
-        },
-        "timezone": "Europe/Moscow",
-        "aggregationLevel": "day",
-    }
+    yesterday_str = str(yesterday)
     headers_auth = {"Authorization": f"Bearer {WB_TOKEN}"}
 
-    paths = [
-        f"{ANALYT_HOST}/api/v2/nm-report/detail",
-        f"{ANALYT_HOST}/api/v2/nm-report/detail/history",
-        f"{ANALYT_HOST}/api/v1/nm-report/detail",
-        f"{ANALYT_HOST}/api/v1/nm-report/detail/history",
-    ]
+    print(f"\n=== DEBUG: Sales Funnel history for {yesterday} ===")
+    await asyncio.sleep(62)  # rate limit
 
-    for path in paths:
-        await asyncio.sleep(3)
-        print(f"\nPOST {path}")
-        try:
-            resp = requests.post(path, headers=headers_auth, json=nm_body, timeout=30)
-            print(f"  Status: {resp.status_code}")
-            if resp.ok:
-                data = resp.json()
-                print(f"  Keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
-                cards = data.get("data", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
-                print(f"  Items: {len(cards)}")
+    funnel_url = f"{ANALYT_HOST}/api/analytics/v3/sales-funnel/products/history"
+    funnel_body = {
+        "selectedPeriod": {
+            "start": yesterday_str,
+            "end": yesterday_str,
+        },
+        "nmIds": [],
+        "skipDeletedNm": True,
+        "aggregationLevel": "day",
+    }
 
-                total_ord = 0
-                total_sum = 0
-                for card in cards:
-                    if isinstance(card, dict):
-                        hist = card.get("history", [])
-                        if hist:
-                            for day in hist:
-                                total_ord += day.get("ordersCount", 0)
-                                total_sum += day.get("ordersSumRub", 0)
-                        else:
-                            total_ord += card.get("ordersCount", 0)
-                            total_sum += card.get("ordersSumRub", 0)
+    try:
+        resp = requests.post(funnel_url, headers=headers_auth, json=funnel_body, timeout=30)
+        print(f"POST {funnel_url}")
+        print(f"  Status: {resp.status_code}")
+        if resp.ok:
+            data = resp.json()
+            print(f"  Response keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
+            items = data.get("data", []) if isinstance(data, dict) else []
+            print(f"  Products: {len(items)}")
 
-                print(f"  ИТОГО: orders={total_ord} (кабинет=56) sum={total_sum:.2f} (кабинет≈102908)")
+            total_orders = 0
+            total_order_sum = 0
+            total_buyouts = 0
+            total_buyout_sum = 0
 
-                if cards and isinstance(cards[0], dict):
-                    print(f"  First card keys: {list(cards[0].keys())[:15]}")
+            for item in items:
+                prod = item.get("product", {})
+                nm = prod.get("nmId", "?")
+                title = prod.get("title", "?")[:40]
+                hist = item.get("history", [])
+                for day in hist:
+                    oc = day.get("orderCount", 0)
+                    os_ = day.get("orderSum", 0)
+                    bc = day.get("buyoutCount", 0)
+                    bs = day.get("buyoutSum", 0)
+                    total_orders += oc
+                    total_order_sum += os_
+                    total_buyouts += bc
+                    total_buyout_sum += bs
+                    if oc > 0:
+                        print(f"  nm={nm} '{title}' orders={oc} sum={os_} buyouts={bc}")
 
-                if total_ord > 0:
-                    print("  *** ЭТОТ ПУТЬ РАБОТАЕТ! ***")
-                    break
-            else:
-                err = resp.text[:150].replace('\n', ' ')
-                print(f"  Error: {err}")
-        except Exception as e:
-            print(f"  Error: {e}")
+            print(f"\n  ИТОГО: orders={total_orders} sum={total_order_sum:.0f}")
+            print(f"         buyouts={total_buyouts} buyout_sum={total_buyout_sum:.0f}")
+            print(f"  (кабинет: 56 заказов, ~102908₽)")
+
+            if total_orders > 0:
+                print("  *** SALES FUNNEL РАБОТАЕТ! ***")
+        else:
+            print(f"  Error: {resp.text[:300]}")
+    except Exception as e:
+        print(f"  Exception: {e}")
+
+    # ===== DEBUG: Stocks on WB warehouses (замена warehouse_remains) =====
+    print(f"\n=== DEBUG: Stocks WB warehouses ===")
+    await asyncio.sleep(62)  # rate limit
+
+    stocks_url = f"{ANALYT_HOST}/api/analytics/v1/stocks-report/wb-warehouses"
+    stocks_body = {
+        "limit": 1000,
+        "offset": 0,
+    }
+
+    try:
+        resp = requests.post(stocks_url, headers=headers_auth, json=stocks_body, timeout=30)
+        print(f"POST {stocks_url}")
+        print(f"  Status: {resp.status_code}")
+        if resp.ok:
+            data = resp.json()
+            print(f"  Response keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
+            items_data = data.get("data", {})
+            items = items_data.get("items", []) if isinstance(items_data, dict) else []
+            print(f"  Stock rows: {len(items)}")
+
+            # Агрегируем по nmId
+            stock_by_nm = {}
+            for it in items:
+                nm = it.get("nmId", 0)
+                qty = it.get("quantity", 0)
+                wh = it.get("warehouseName", "?")
+                stock_by_nm[nm] = stock_by_nm.get(nm, 0) + qty
+                if qty > 0:
+                    print(f"  nm={nm} wh={wh} qty={qty}")
+
+            total_stock = sum(stock_by_nm.values())
+            print(f"\n  ИТОГО: {len(stock_by_nm)} SKU, {total_stock} шт на складах WB")
+
+            if total_stock > 0:
+                print("  *** STOCKS РАБОТАЕТ! ***")
+        else:
+            print(f"  Error: {resp.text[:300]}")
+    except Exception as e:
+        print(f"  Exception: {e}")
 
     print("\n=== END DEBUG ===")
 
