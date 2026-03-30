@@ -2,6 +2,7 @@ name: WB Daily Report
 
 on:
   schedule:
+    # Каждый день в 09:00 МСК (= 06:00 UTC)
     - cron: '0 6 * * *'
   workflow_dispatch:
 
@@ -20,7 +21,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests
+        run: pip install requests>=2.31.0 matplotlib>=3.5.0 numpy>=1.24.0
 
       - name: Run WB report
         env:
