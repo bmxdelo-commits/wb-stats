@@ -437,6 +437,16 @@ async def main():
     orders, sales, remains = await fetch_all_data(WB_TOKEN, date_from)
     print(f"Got {len(orders)} orders, {len(sales)} sales, {len(remains)} SKUs in stock")
 
+    # DEBUG: print first order fields to understand API structure
+    if orders:
+        o = orders[0]
+        print(f"DEBUG first order keys: {list(o.keys())}")
+        print(f"DEBUG first order: nmId={o.get('nmId')} totalPrice={o.get('totalPrice')} "
+              f"priceWithDisc={o.get('priceWithDisc')} discountPercent={o.get('discountPercent')} "
+              f"finishedPrice={o.get('finishedPrice')} spp={o.get('spp')} "
+              f"gNumber={o.get('gNumber')} orderType={o.get('orderType')} "
+              f"isCancel={o.get('isCancel')} quantityFull={o.get('quantityFull')}")
+
     report_date = find_report_date(orders, sales)
     if not report_date:
         print("No data found — aborting")
