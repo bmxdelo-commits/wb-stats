@@ -1,467 +1,478 @@
 #!/usr/bin/env python3
-"""
-WB Analytics — ежедневный дайджест в Telegram
-Продажи | Остатки | ABC-анализ | Поисковые запросы
+# -*- coding: utf-8 -*-
 
-Запуск: python wb_report.py
-Env vars: WB_TOKEN, TG_BOT_TOKEN, TG_CHAT_ID
-"""
+import matplotlib
+matplotlib.use("Agg")
 
 import os
-import time
-import json
-import logging
+import asyncio
 import requests
 from datetime import datetime, timedelta, timezone
-from collections import defaultdict
+from io import BytesIO
+from dataclasses import dataclass
+from typing import Optional, List, Dict, Tuple
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+import numpy as np
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger(__name__)
+# ===================== CONSTANTS =====================
 
-# ── Конфиг ────────────────────────────────────────────────────────────────────
-WB_TOKEN    = os.environ["WB_TOKEN"]
-TG_BOT      = os.environ["TG_BOT_TOKEN"]
-TG_CHAT     = os.environ["TG_CHAT_ID"]
-
-STATS_HOST  = "https://statistics-api.wildberries.ru"
+STATS_HOST = "https://statistics-api.wildberries.ru"
 ANALYT_HOST = "https://seller-analytics-api.wildberries.ru"
 
-HEADERS = {"Authorization": WB_TOKEN}
+WB_TOKEN = os.getenv("WB_TOKEN", "")
+TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "")
+TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 
 MSK = timezone(timedelta(hours=3))
 
+MONTHS_RU = {
+    1: "января", 2: "февраля", 3: "марта", 4: "апреля",
+    5: "мая", 6: "июня", 7: "июля", 8: "августа",
+    9: "сентября", 10: "октября", 11: "ноября", 12: "декабря"
+}
 
-# ── WB API helpers ────────────────────────────────────────────────────────────
+COLORS = {
+    "header_bg": "#1C3F6E",
+    "kpi_blue": "#2563EB",
+    "kpi_green": "#16A34A",
+    "kpi_red": "#DC2626",
+    "kpi_yellow": "#D97706",
+    "table_header": "#1C3F6E",
+    "table_alt": "#F8FAFC",
+    "critical_bg": "#FEE2E2",
+    "critical_text": "#DC2626",
+    "warning_bg": "#FEF9C3",
+    "warning_text": "#92400E",
+}
 
-def wb_get(url: str, params: dict = None, retries: int = 3) -> list | dict:
-    """GET-запрос к WB API с повтором при 429."""
-    for attempt in range(retries):
-        try:
-            r = requests.get(url, headers=HEADERS, params=params, timeout=30)
-            if r.status_code == 429:
-                wait = 65 if attempt == 0 else 120
-                log.warning(f"429 rate limit — жду {wait}s")
-                time.sleep(wait)
-                continue
-            r.raise_for_status()
-            return r.json()
-        except requests.exceptions.HTTPError as e:
-            log.error(f"HTTP error {e} | url={url}")
-            if attempt == retries - 1:
-                raise
-            time.sleep(10)
-    return []
+# ===================== HELPERS =====================
 
-
-def wb_post(url: str, payload: dict, retries: int = 3) -> dict:
-    """POST-запрос к WB API."""
-    for attempt in range(retries):
-        try:
-            r = requests.post(url, headers=HEADERS, json=payload, timeout=30)
-            if r.status_code == 429:
-                wait = 65
-                log.warning(f"429 rate limit — жду {wait}s")
-                time.sleep(wait)
-                continue
-            r.raise_for_status()
-            return r.json()
-        except requests.exceptions.HTTPError as e:
-            log.error(f"HTTP error {e} | url={url}")
-            if attempt == retries - 1:
-                raise
-            time.sleep(10)
-    return {}
+def parse_date(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    s = s.strip()
+    if "Z" in s or ("+" in s[10:]) or (len(s) > 19 and s[19] == "-"):
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    else:
+        dt = datetime.fromisoformat(s).replace(tzinfo=MSK)
+    return dt.astimezone(MSK)
 
 
-# ── Получение данных ──────────────────────────────────────────────────────────
-
-def get_orders(date_from: str) -> list:
-    """Все заказы начиная с date_from (flag=1 = все за дату, не инкрементально)."""
-    log.info(f"Загружаю заказы с {date_from}...")
-    result = []
-    current_date = date_from
-
-    while True:
-        data = wb_get(
-            f"{STATS_HOST}/api/v1/supplier/orders",
-            params={"dateFrom": current_date, "flag": 1}
-        )
-        if not data:
-            break
-        result.extend(data)
-        # Если вернулось 80000 строк — есть ещё, берём lastChangeDate последней строки
-        if len(data) < 80000:
-            break
-        current_date = data[-1]["lastChangeDate"]
-        time.sleep(62)  # rate limit: 1 req/min
-
-    log.info(f"Загружено заказов: {len(result)}")
-    return result
+def format_date_ru(dt: datetime) -> str:
+    if not dt:
+        return ""
+    return f"{dt.day} {MONTHS_RU[dt.month]} {dt.year}"
 
 
-def get_sales(date_from: str) -> list:
-    """Все продажи начиная с date_from."""
-    log.info(f"Загружаю продажи с {date_from}...")
-    time.sleep(62)  # rate limit между запросами
-
-    result = []
-    current_date = date_from
-
-    while True:
-        data = wb_get(
-            f"{STATS_HOST}/api/v1/supplier/sales",
-            params={"dateFrom": current_date, "flag": 1}
-        )
-        if not data:
-            break
-        result.extend(data)
-        if len(data) < 80000:
-            break
-        current_date = data[-1]["lastChangeDate"]
-        time.sleep(62)
-
-    log.info(f"Загружено продаж: {len(result)}")
-    return result
+def hex_to_rgb(hex_color: str) -> Tuple[float, float, float]:
+    hex_color = hex_color.lstrip("#")
+    return tuple(int(hex_color[i:i+2], 16) / 255.0 for i in (0, 2, 4))
 
 
-def get_warehouse_remains() -> list:
-    """Async-отчёт об остатках на складах WB."""
-    log.info("Запрашиваю отчёт об остатках...")
-    time.sleep(62)
+# ===================== WB API =====================
 
-    # Шаг 1: создаём задачу
-    resp = wb_get(f"{ANALYT_HOST}/api/v1/warehouse_remains", params={"groupByBrand": False})
-    task_id = resp.get("data", {}).get("taskId") if isinstance(resp, dict) else None
-
-    if not task_id:
-        log.error(f"Не удалось создать задачу остатков: {resp}")
+def get_orders(date_from: datetime, wb_token: str) -> List[Dict]:
+    url = f"{STATS_HOST}/api/v1/supplier/orders"
+    headers = {"Authorization": f"Bearer {wb_token}"}
+    params = {"dateFrom": date_from.isoformat(), "flag": 1}
+    try:
+        resp = requests.get(url, headers=headers, params=params, timeout=30)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        print(f"Error fetching orders: {e}")
         return []
 
-    log.info(f"Задача остатков: {task_id} — жду готовности...")
 
-    # Шаг 2: ждём готовности (до 10 минут)
-    for _ in range(20):
-        time.sleep(30)
-        status_resp = wb_get(
-            f"{ANALYT_HOST}/api/v1/warehouse_remains/tasks/{task_id}/status"
-        )
-        status = status_resp.get("data", {}).get("status") if isinstance(status_resp, dict) else None
-        log.info(f"Статус задачи: {status}")
-        if status == "done":
-            break
-        if status in ("error", "purged"):
-            log.error(f"Задача провалилась: {status}")
-            return []
-
-    # Шаг 3: скачиваем
-    result = wb_get(f"{ANALYT_HOST}/api/v1/warehouse_remains/tasks/{task_id}/download")
-    data = result.get("data", []) if isinstance(result, dict) else result
-    log.info(f"Загружено остатков: {len(data)} строк")
-    return data if isinstance(data, list) else []
-
-
-def get_search_queries(nm_ids: list) -> list:
-    """Поисковые запросы по артикулам (топ-20 SKU)."""
-    if not nm_ids:
+def get_sales(date_from: datetime, wb_token: str) -> List[Dict]:
+    url = f"{STATS_HOST}/api/v1/supplier/sales"
+    headers = {"Authorization": f"Bearer {wb_token}"}
+    params = {"dateFrom": date_from.isoformat(), "flag": 1}
+    try:
+        resp = requests.get(url, headers=headers, params=params, timeout=30)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception as e:
+        print(f"Error fetching sales: {e}")
         return []
 
-    log.info(f"Загружаю поисковые запросы для {len(nm_ids)} SKU...")
-    time.sleep(62)
 
-    today = datetime.now(MSK)
-    date_from = (today - timedelta(days=7)).strftime("%Y-%m-%d")
-    date_to = today.strftime("%Y-%m-%d")
+async def get_warehouse_remains(wb_token: str) -> Dict[int, int]:
+    headers = {"Authorization": f"Bearer {wb_token}"}
+    url = f"{ANALYT_HOST}/api/v1/warehouse_remains"
+    try:
+        resp = requests.get(url, headers=headers, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+        request_id = data.get("data", {}).get("requestId")
+        if not request_id:
+            print("No requestId in warehouse_remains response")
+            return {}
 
-    result = []
-    for nm_id in nm_ids[:5]:  # берём топ-5 чтобы не убиться о rate limit
-        try:
-            resp = wb_post(
-                f"{ANALYT_HOST}/api/v2/search-report/product/search-texts",
-                payload={
-                    "nmId": nm_id,
-                    "dateFrom": date_from,
-                    "dateTo": date_to
-                }
+        for attempt in range(10):
+            await asyncio.sleep(5)
+            resp = requests.get(
+                f"{ANALYT_HOST}/api/v1/warehouse_remains",
+                headers=headers,
+                params={"requestId": request_id},
+                timeout=30
             )
-            queries = resp.get("data", {}).get("rows", []) if isinstance(resp, dict) else []
-            if queries:
-                result.append({"nmId": nm_id, "queries": queries[:5]})
-            time.sleep(62)
-        except Exception as e:
-            log.warning(f"Ошибка запроса для nmId={nm_id}: {e}")
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("data", {}).get("isFinished"):
+                remains = data.get("data", {}).get("warehouseRemains", [])
+                result = {}
+                for item in remains:
+                    sku = item.get("nmID")
+                    qty = item.get("quantityFull", 0)
+                    if sku:
+                        result[sku] = qty
+                return result
 
-    return result
+        print("Timeout waiting for warehouse_remains")
+        return {}
+    except Exception as e:
+        print(f"Error fetching warehouse_remains: {e}")
+        return {}
 
 
-# ── Аналитика ─────────────────────────────────────────────────────────────────
+async def fetch_all_data(wb_token: str, date_from: datetime) -> Tuple[List, List, Dict]:
+    orders = get_orders(date_from, wb_token)
+    await asyncio.sleep(62)
+    sales = get_sales(date_from, wb_token)
+    await asyncio.sleep(62)
+    remains = await get_warehouse_remains(wb_token)
+    await asyncio.sleep(30)
+    return orders, sales, remains
 
-def filter_yesterday(records: list, date_field: str) -> list:
-    """Фильтрует записи за вчера (МСК)."""
-    yesterday = (datetime.now(MSK) - timedelta(days=1)).date()
+
+def find_report_date(orders: List[Dict], sales: List[Dict]) -> Optional[datetime]:
+    dates = set()
+    for item in orders + sales:
+        date_str = item.get("date")
+        if date_str:
+            dt = parse_date(date_str)
+            if dt:
+                dates.add(dt.replace(hour=0, minute=0, second=0, microsecond=0))
+    if not dates:
+        return None
+    today_msk = datetime.now(MSK).replace(hour=0, minute=0, second=0, microsecond=0)
+    for days_back in range(1, 6):
+        check_date = today_msk - timedelta(days=days_back)
+        if check_date in dates:
+            return check_date
+    return max(dates)
+
+
+@dataclass
+class ProductMetrics:
+    sku: int
+    name: str
+    orders_today: int
+    sales_today: int
+    cancellations_today: int
+    revenue_today: float
+    stock_qty: int
+    days_remaining: int   # stock / avg_daily_orders_30d
+
+
+def aggregate_metrics(
+    orders: List[Dict],
+    sales: List[Dict],
+    remains: Dict[int, int],
+    report_date: datetime
+) -> List[ProductMetrics]:
+
+    # 30-day velocity per SKU (non-cancelled orders)
+    velocity: Dict[int, int] = {}
+    for order in orders:
+        if order.get("isCancel"):
+            continue
+        sku = order.get("nmID")
+        if sku:
+            velocity[sku] = velocity.get(sku, 0) + 1
+
+    # Today's metrics
+    today_metrics: Dict[int, dict] = {}
+
+    for order in orders:
+        date_str = order.get("date")
+        if not date_str:
+            continue
+        order_date = parse_date(date_str)
+        if not order_date or order_date.date() != report_date.date():
+            continue
+        sku = order.get("nmID")
+        name = order.get("vendorCode", f"SKU {sku}")
+        if sku not in today_metrics:
+            today_metrics[sku] = {"name": name, "orders": 0, "sales": 0, "cancellations": 0, "revenue": 0.0}
+        today_metrics[sku]["orders"] += 1
+        today_metrics[sku]["revenue"] += order.get("totalPrice", 0)
+
+    for sale in sales:
+        date_str = sale.get("date")
+        if not date_str:
+            continue
+        sale_date = parse_date(date_str)
+        if not sale_date or sale_date.date() != report_date.date():
+            continue
+        sku = sale.get("nmID")
+        name = sale.get("vendorCode", f"SKU {sku}")
+        if sku not in today_metrics:
+            today_metrics[sku] = {"name": name, "orders": 0, "sales": 0, "cancellations": 0, "revenue": 0.0}
+        today_metrics[sku]["sales"] += 1
+        if sale.get("isCancel"):
+            today_metrics[sku]["cancellations"] += 1
+
     result = []
-    for r in records:
-        try:
-            dt_str = r.get(date_field, "")
-            dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00")).astimezone(MSK).date()
-            if dt == yesterday:
-                result.append(r)
-        except Exception:
-            pass
-    return result
+    for sku, data in today_metrics.items():
+        stock_qty = remains.get(sku, 0)
+        v30 = velocity.get(sku, 0)
+        avg_daily = v30 / 30.0
+        days_rem = int(stock_qty / avg_daily) if avg_daily > 0 else 9999
+
+        result.append(ProductMetrics(
+            sku=sku,
+            name=data["name"],
+            orders_today=data["orders"],
+            sales_today=data["sales"],
+            cancellations_today=data["cancellations"],
+            revenue_today=data["revenue"],
+            stock_qty=stock_qty,
+            days_remaining=min(days_rem, 9999),
+        ))
+
+    return sorted(result, key=lambda x: x.revenue_today, reverse=True)
 
 
-def compute_sales_summary(orders: list, sales: list) -> dict:
-    """Сводка продаж за вчера."""
-    yesterday_orders = filter_yesterday(orders, "date")
-    yesterday_sales  = filter_yesterday(sales, "date")
+def get_7day_trend(
+    orders: List[Dict],
+    sales: List[Dict],
+    report_date: datetime
+) -> Tuple[List[str], List[int], List[int]]:
+    daily_orders: Dict = {}
+    daily_sales: Dict = {}
+    for i in range(7):
+        d = (report_date - timedelta(days=i)).date()
+        daily_orders[d] = 0
+        daily_sales[d] = 0
 
-    total_orders   = len(yesterday_orders)
-    total_sales    = len([s for s in yesterday_sales if s.get("saleID", "").startswith("S")])
-    total_returns  = len([s for s in yesterday_sales if s.get("saleID", "").startswith("R")])
-    revenue        = sum(s.get("priceWithDisc", 0) for s in yesterday_sales if s.get("saleID", "").startswith("S"))
-    cancellations  = len([o for o in yesterday_orders if o.get("isCancel", False)])
+    for order in orders:
+        dt = parse_date(order.get("date"))
+        if dt and dt.date() in daily_orders:
+            daily_orders[dt.date()] += 1
 
-    buyout_rate = round(total_sales / total_orders * 100) if total_orders > 0 else 0
+    for sale in sales:
+        dt = parse_date(sale.get("date"))
+        if dt and dt.date() in daily_sales:
+            daily_sales[dt.date()] += 1
 
-    # Топ-10 по выручке
-    by_sku = defaultdict(lambda: {"name": "", "qty": 0, "revenue": 0.0})
-    for s in yesterday_sales:
-        if not s.get("saleID", "").startswith("S"):
-            continue
-        nm = s.get("nmId", 0)
-        by_sku[nm]["name"]    = s.get("subject", "") or s.get("supplierArticle", str(nm))
-        by_sku[nm]["qty"]    += 1
-        by_sku[nm]["revenue"] += s.get("priceWithDisc", 0)
-
-    top_skus = sorted(by_sku.items(), key=lambda x: x[1]["revenue"], reverse=True)[:10]
-
-    return {
-        "orders":       total_orders,
-        "sales":        total_sales,
-        "returns":      total_returns,
-        "cancellations": cancellations,
-        "revenue":      revenue,
-        "buyout_rate":  buyout_rate,
-        "top_skus":     top_skus,
-    }
+    dates, ord_list, sal_list = [], [], []
+    for i in range(6, -1, -1):
+        d = (report_date - timedelta(days=i)).date()
+        dates.append(d.strftime("%d.%m"))
+        ord_list.append(daily_orders.get(d, 0))
+        sal_list.append(daily_sales.get(d, 0))
+    return dates, ord_list, sal_list
 
 
-def compute_abc(sales: list, days: int = 30) -> dict:
-    """ABC-анализ по выручке за последние N дней."""
-    cutoff = (datetime.now(MSK) - timedelta(days=days)).date()
-    by_sku = defaultdict(lambda: {"name": "", "revenue": 0.0, "qty": 0})
+# ===================== PNG GENERATION =====================
 
-    for s in sales:
-        if not s.get("saleID", "").startswith("S"):
-            continue
-        try:
-            dt = datetime.fromisoformat(
-                s.get("date", "").replace("Z", "+00:00")
-            ).astimezone(MSK).date()
-            if dt < cutoff:
-                continue
-        except Exception:
-            continue
+def generate_report_png(
+    metrics: List[ProductMetrics],
+    report_date: datetime,
+    orders_count: int,
+    sales_count: int,
+    cancellations: int,
+    revenue: float,
+    dates_7d: List[str],
+    orders_7d: List[int],
+    sales_7d: List[int],
+) -> BytesIO:
 
-        nm = s.get("nmId", 0)
-        by_sku[nm]["name"]    = s.get("subject", "") or s.get("supplierArticle", str(nm))
-        by_sku[nm]["revenue"] += s.get("priceWithDisc", 0)
-        by_sku[nm]["qty"]    += 1
+    fig = plt.figure(figsize=(13, 15), dpi=150, facecolor="white")
+    gs = fig.add_gridspec(4, 1, height_ratios=[0.8, 2.5, 3, 2], hspace=0.35)
 
-    if not by_sku:
-        return {"A": [], "B": [], "C": [], "total_revenue": 0}
-
-    sorted_skus   = sorted(by_sku.items(), key=lambda x: x[1]["revenue"], reverse=True)
-    total_revenue = sum(v["revenue"] for _, v in sorted_skus)
-
-    groups = {"A": [], "B": [], "C": []}
-    cumulative = 0.0
-    for nm, v in sorted_skus:
-        cumulative += v["revenue"]
-        share = cumulative / total_revenue
-        if share <= 0.80:
-            groups["A"].append((nm, v))
-        elif share <= 0.95:
-            groups["B"].append((nm, v))
-        else:
-            groups["C"].append((nm, v))
-
-    return {**groups, "total_revenue": total_revenue}
-
-
-def compute_stock_alerts(remains: list, sales: list, days: int = 30) -> list:
-    """Критические остатки: SKU с запасом < 14 дней при текущем темпе продаж."""
-    cutoff = (datetime.now(MSK) - timedelta(days=days)).date()
-
-    # Продажи за период
-    sales_by_nm = defaultdict(int)
-    for s in sales:
-        if not s.get("saleID", "").startswith("S"):
-            continue
-        try:
-            dt = datetime.fromisoformat(
-                s.get("date", "").replace("Z", "+00:00")
-            ).astimezone(MSK).date()
-            if dt >= cutoff:
-                sales_by_nm[s.get("nmId", 0)] += 1
-        except Exception:
-            pass
-
-    # Текущие остатки
-    stock_by_nm = defaultdict(lambda: {"name": "", "qty": 0})
-    for r in remains:
-        nm = r.get("nmId", 0)
-        stock_by_nm[nm]["name"] = r.get("subjectName", "") or r.get("supplierArticle", str(nm))
-        stock_by_nm[nm]["qty"] += r.get("quantityWarehousesFull", 0)
-
-    alerts = []
-    for nm, stock in stock_by_nm.items():
-        if stock["qty"] <= 0:
-            continue
-        daily_sales = sales_by_nm.get(nm, 0) / days
-        if daily_sales <= 0:
-            continue
-        days_left = int(stock["qty"] / daily_sales)
-        if days_left <= 14:
-            alerts.append({
-                "nm":       nm,
-                "name":     stock["name"],
-                "qty":      stock["qty"],
-                "days":     days_left,
-                "daily":    round(daily_sales, 1),
-            })
-
-    return sorted(alerts, key=lambda x: x["days"])
-
-
-# ── Telegram ──────────────────────────────────────────────────────────────────
-
-def fmt_money(value: float) -> str:
-    return f"{value:,.0f}".replace(",", " ") + " ₽"
-
-
-def send_telegram(text: str) -> None:
-    """Отправляет сообщение в Telegram. Разбивает если > 4096 символов."""
-    url = f"https://api.telegram.org/bot{TG_BOT}/sendMessage"
-    chunks = [text[i:i+4000] for i in range(0, len(text), 4000)]
-    for chunk in chunks:
-        r = requests.post(url, json={
-            "chat_id": TG_CHAT,
-            "text": chunk,
-            "parse_mode": "HTML"
-        }, timeout=15)
-        r.raise_for_status()
-        if len(chunks) > 1:
-            time.sleep(1)
-
-
-def build_message(summary: dict, abc: dict, alerts: list, search: list) -> str:
-    yesterday = (datetime.now(MSK) - timedelta(days=1)).strftime("%d %B %Y")
-    lines = []
-
-    # Заголовок
-    lines.append(f"📊 <b>WB Дайджест — {yesterday}</b>")
-    lines.append("")
-
-    # Продажи
-    lines.append("💰 <b>ПРОДАЖИ ВЧЕРА</b>")
-    lines.append(f"Выручка: <b>{fmt_money(summary['revenue'])}</b>")
-    lines.append(
-        f"Заказов: {summary['orders']} | Продаж: {summary['sales']} | "
-        f"Возвратов: {summary['returns']} | Отмен: {summary['cancellations']}"
+    # ── HEADER ──────────────────────────────────────────────────────────
+    ax_h = fig.add_subplot(gs[0])
+    ax_h.axis("off")
+    ax_h.text(
+        0.5, 0.5,
+        f"Отчёт Wildberries за {format_date_ru(report_date)}",
+        fontsize=24, fontweight="bold", ha="center", va="center",
+        fontfamily="DejaVu Sans",
+        bbox=dict(boxstyle="round,pad=0.8",
+                  facecolor=hex_to_rgb(COLORS["header_bg"]),
+                  edgecolor="none"),
+        color="white",
     )
-    if summary['orders'] > 0:
-        lines.append(f"Выкуп: <b>{summary['buyout_rate']}%</b>")
-    lines.append("")
 
-    # Топ-5 SKU вчера
-    if summary["top_skus"]:
-        lines.append("🏆 <b>ТОП-5 по выручке вчера</b>")
-        for i, (nm, v) in enumerate(summary["top_skus"][:5], 1):
-            lines.append(f"{i}. {v['name']} — {v['qty']} шт / {fmt_money(v['revenue'])}")
-        lines.append("")
+    # ── KPI CARDS ────────────────────────────────────────────────────────
+    ax_k = fig.add_subplot(gs[1])
+    ax_k.axis("off")
+    ax_k.set_xlim(0, 4)
+    ax_k.set_ylim(0, 1)
 
-    # Критические остатки
-    if alerts:
-        lines.append("📦 <b>КРИТИЧЕСКИЕ ОСТАТКИ (менее 14 дней)</b>")
-        for a in alerts[:10]:
-            emoji = "🔴" if a["days"] <= 5 else "🟡"
-            lines.append(
-                f"{emoji} {a['name']} (nmId {a['nm']}) — "
-                f"{a['qty']} шт / <b>{a['days']} дн</b> "
-                f"({a['daily']} шт/день)"
-            )
-        if len(alerts) > 10:
-            lines.append(f"... и ещё {len(alerts) - 10} позиций")
-        lines.append("")
+    kpis = [
+        ("Заказы",     str(orders_count),            COLORS["kpi_blue"]),
+        ("Продажи",    str(sales_count),              COLORS["kpi_green"]),
+        ("Отмены",     str(cancellations),            COLORS["kpi_red"]),
+        ("Выручка Br", f"{revenue:,.0f}",             COLORS["kpi_yellow"]),
+    ]
+    for idx, (label, value, color) in enumerate(kpis):
+        x = idx + 0.5
+        rect = Rectangle((x - 0.4, 0.1), 0.8, 0.8,
+                          linewidth=0, facecolor=hex_to_rgb(color))
+        ax_k.add_patch(rect)
+        ax_k.text(x, 0.72, label,
+                  fontsize=11, ha="center", va="center",
+                  fontfamily="DejaVu Sans", color="white", fontweight="bold")
+        ax_k.text(x, 0.35, value,
+                  fontsize=16, ha="center", va="center",
+                  fontfamily="DejaVu Sans", color="white", fontweight="bold")
 
-    # ABC
-    lines.append("🔠 <b>ABC-АНАЛИЗ (30 дней)</b>")
-    lines.append(f"Итого выручка: {fmt_money(abc['total_revenue'])}")
-    lines.append(f"A — {len(abc['A'])} SKU → 80% выручки")
-    lines.append(f"B — {len(abc['B'])} SKU → 15% выручки")
-    lines.append(f"C — {len(abc['C'])} SKU → 5% выручки (хвост)")
-    if abc["A"]:
-        lines.append("")
-        lines.append("Группа A:")
-        for nm, v in abc["A"][:10]:
-            lines.append(f"  • {v['name']} — {fmt_money(v['revenue'])} / {v['qty']} шт")
-        if len(abc["A"]) > 10:
-            lines.append(f"  ... и ещё {len(abc['A']) - 10}")
-    lines.append("")
+    # ── TABLE ────────────────────────────────────────────────────────────
+    ax_t = fig.add_subplot(gs[2])
+    ax_t.axis("off")
 
-    # Поисковые запросы
-    if search:
-        lines.append("🔍 <b>ТОП ПОИСКОВЫЕ ЗАПРОСЫ (7 дней)</b>")
-        for item in search:
-            nm = item["nmId"]
-            lines.append(f"<b>nmId {nm}:</b>")
-            for q in item["queries"][:3]:
-                keyword  = q.get("keyword", "—")
-                orders   = q.get("ordersCount", 0)
-                position = q.get("avgPosition", "—")
-                lines.append(f"  • «{keyword}» — {orders} заказов, позиция ~{position}")
-        lines.append("")
+    headers = ["Артикул", "Заказов", "Продаж", "Отмен", "Выручка Br", "Остаток", "Дней"]
+    table_data = []
+    for m in metrics[:15]:
+        days_str = str(m.days_remaining) if m.days_remaining < 9999 else "—"
+        table_data.append([
+            m.name[:20],
+            str(m.orders_today),
+            str(m.sales_today),
+            str(m.cancellations_today),
+            f"{m.revenue_today:,.0f}",
+            str(m.stock_qty),
+            days_str,
+        ])
 
-    lines.append(f"<i>Обновлено {datetime.now(MSK).strftime('%H:%M МСК')}</i>")
-    return "\n".join(lines)
+    tbl = ax_t.table(
+        cellText=table_data, colLabels=headers,
+        cellLoc="center", loc="center",
+        colWidths=[0.25, 0.1, 0.1, 0.1, 0.15, 0.1, 0.1],
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(9)
+    tbl.scale(1, 2)
+
+    for i in range(len(headers)):
+        cell = tbl[(0, i)]
+        cell.set_facecolor(hex_to_rgb(COLORS["table_header"]))
+        cell.set_text_props(weight="bold", color="white", fontfamily="DejaVu Sans")
+
+    for row in range(1, len(table_data) + 1):
+        for col in range(len(headers)):
+            cell = tbl[(row, col)]
+            if row % 2 == 0:
+                cell.set_facecolor(hex_to_rgb(COLORS["table_alt"]))
+            if col == 6:
+                days_val = table_data[row - 1][6]
+                if days_val != "—":
+                    d = int(days_val)
+                    if d <= 5:
+                        cell.set_facecolor(hex_to_rgb(COLORS["critical_bg"]))
+                        cell.set_text_props(color=hex_to_rgb(COLORS["critical_text"]), fontweight="bold")
+                    elif d <= 14:
+                        cell.set_facecolor(hex_to_rgb(COLORS["warning_bg"]))
+                        cell.set_text_props(color=hex_to_rgb(COLORS["warning_text"]), fontweight="bold")
+            cell.set_text_props(fontfamily="DejaVu Sans")
+
+    # ── 7-DAY TREND ──────────────────────────────────────────────────────
+    ax_c = fig.add_subplot(gs[3])
+    x = np.arange(len(dates_7d))
+    w = 0.35
+    ax_c.bar(x - w/2, orders_7d, w, label="Заказы",
+             color=hex_to_rgb(COLORS["kpi_blue"]), alpha=0.85)
+    ax_c.bar(x + w/2, sales_7d, w, label="Продажи",
+             color=hex_to_rgb(COLORS["kpi_green"]), alpha=0.85)
+    ax_c.set_xticks(x)
+    ax_c.set_xticklabels(dates_7d, fontfamily="DejaVu Sans")
+    ax_c.set_xlabel("Дата", fontsize=11, fontfamily="DejaVu Sans", fontweight="bold")
+    ax_c.set_ylabel("Количество", fontsize=11, fontfamily="DejaVu Sans", fontweight="bold")
+    ax_c.set_title("Тренд за 7 дней", fontsize=13, fontfamily="DejaVu Sans",
+                   fontweight="bold", pad=10)
+    ax_c.legend(fontsize=10, loc="upper left", framealpha=0.9)
+    ax_c.grid(axis="y", alpha=0.3, linestyle="--")
+    ax_c.set_axisbelow(True)
+
+    buf = BytesIO()
+    plt.savefig(buf, format="png", bbox_inches="tight", facecolor="white")
+    buf.seek(0)
+    plt.close(fig)
+    return buf
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ===================== TELEGRAM =====================
 
-def main():
-    log.info("=== WB Analytics запущен ===")
-    today_msk = datetime.now(MSK)
-    date_30d  = (today_msk - timedelta(days=30)).strftime("%Y-%m-%dT00:00:00")
+def send_telegram_photo(buf: BytesIO, caption: str, bot_token: str, chat_id: str) -> bool:
+    url = f"https://api.telegram.org/bot{bot_token}/sendPhoto"
+    try:
+        resp = requests.post(
+            url,
+            files={"photo": ("report.png", buf, "image/png")},
+            data={"chat_id": chat_id, "caption": caption},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"Error sending Telegram photo: {e}")
+        return False
 
-    # 1. Заказы за 30 дней
-    orders = get_orders(date_30d)
 
-    # 2. Продажи за 30 дней
-    sales = get_sales(date_30d)
+# ===================== MAIN =====================
 
-    # 3. Остатки на складах
-    remains = get_warehouse_remains()
+async def main():
+    if not WB_TOKEN or not TG_BOT_TOKEN or not TG_CHAT_ID:
+        print("Missing env vars: WB_TOKEN, TG_BOT_TOKEN, TG_CHAT_ID")
+        return
 
-    # 4. ABC по продажам
-    abc = compute_abc(sales, days=30)
+    date_from = datetime.now(MSK) - timedelta(days=30)
+    print(f"Fetching WB data from {date_from.isoformat()} ...")
 
-    # 5. Сводка за вчера
-    summary = compute_sales_summary(orders, sales)
+    orders, sales, remains = await fetch_all_data(WB_TOKEN, date_from)
+    print(f"Got {len(orders)} orders, {len(sales)} sales, {len(remains)} SKUs in stock")
 
-    # 6. Критические остатки
-    alerts = compute_stock_alerts(remains, sales, days=30)
+    report_date = find_report_date(orders, sales)
+    if not report_date:
+        print("No data found — aborting")
+        return
+    print(f"Report date: {format_date_ru(report_date)}")
 
-    # 7. Поисковые запросы для топ-SKU группы A
-    top_nm_ids = [nm for nm, _ in abc["A"][:5]]
-    search = get_search_queries(top_nm_ids)
+    metrics = aggregate_metrics(orders, sales, remains, report_date)
 
-    # 8. Собираем и отправляем
-    msg = build_message(summary, abc, alerts, search)
-    log.info("Отправляю в Telegram...")
-    send_telegram(msg)
-    log.info("✅ Готово!")
+    total_orders = sum(m.orders_today for m in metrics)
+    total_sales = sum(m.sales_today for m in metrics)
+    total_cancels = sum(m.cancellations_today for m in metrics)
+    total_revenue = sum(m.revenue_today for m in metrics)
+
+    print(f"Orders={total_orders} Sales={total_sales} Cancels={total_cancels} Revenue={total_revenue:.2f} Br")
+
+    dates_7d, orders_7d, sales_7d = get_7day_trend(orders, sales, report_date)
+
+    print("Generating PNG ...")
+    buf = generate_report_png(
+        metrics, report_date,
+        total_orders, total_sales, total_cancels, total_revenue,
+        dates_7d, orders_7d, sales_7d,
+    )
+
+    caption = (
+        f"📊 WB отчёт — {format_date_ru(report_date)}\n\n"
+        f"Заказы: {total_orders}\n"
+        f"Продажи: {total_sales}\n"
+        f"Отмены: {total_cancels}\n"
+        f"Выручка: {total_revenue:,.0f} Br"
+    )
+
+    print("Sending to Telegram ...")
+    ok = send_telegram_photo(buf, caption, TG_BOT_TOKEN, TG_CHAT_ID)
+    print("Done ✓" if ok else "Failed ✗")
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
