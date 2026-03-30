@@ -208,7 +208,8 @@ def aggregate_metrics(
         if sku not in today_metrics:
             today_metrics[sku] = {"name": name, "orders": 0, "sales": 0, "cancellations": 0, "revenue": 0.0}
         today_metrics[sku]["orders"] += 1
-        today_metrics[sku]["revenue"] += order.get("totalPrice", 0)
+        # finishedPrice = цена после всех скидок (покупатель платит эту сумму)
+        today_metrics[sku]["revenue"] += order.get("finishedPrice", 0)
 
     for sale in sales:
         date_str = sale.get("date")
@@ -437,15 +438,42 @@ async def main():
     orders, sales, remains = await fetch_all_data(WB_TOKEN, date_from)
     print(f"Got {len(orders)} orders, {len(sales)} sales, {len(remains)} SKUs in stock")
 
-    # DEBUG: print first order fields to understand API structure
+    # DEBUG: analyse order count discrepancy (API=44 vs cabinet=56)
     if orders:
         o = orders[0]
         print(f"DEBUG first order keys: {list(o.keys())}")
         print(f"DEBUG first order: nmId={o.get('nmId')} totalPrice={o.get('totalPrice')} "
-              f"priceWithDisc={o.get('priceWithDisc')} discountPercent={o.get('discountPercent')} "
-              f"finishedPrice={o.get('finishedPrice')} spp={o.get('spp')} "
-              f"gNumber={o.get('gNumber')} orderType={o.get('orderType')} "
-              f"isCancel={o.get('isCancel')} quantityFull={o.get('quantityFull')}")
+              f"priceWithDisc={o.get('priceWithDisc')} finishedPrice={o.get('finishedPrice')} "
+              f"spp={o.get('spp')} isCancel={o.get('isCancel')}")
+
+        # Count orders for yesterday by different methods
+        from collections import Counter
+        yesterday = (datetime.now(MSK) - timedelta(days=1)).date()
+        day_orders = [o for o in orders if parse_date(o.get("date")) and parse_date(o.get("date")).date() == yesterday]
+        print(f"DEBUG orders for {yesterday}: {len(day_orders)} records")
+
+        # Check unique srid (order line ID)
+        srids = [o.get("srid") for o in day_orders]
+        print(f"DEBUG unique srid: {len(set(srids))}, total srid: {len(srids)}")
+
+        # Check unique gNumber (group number = one customer order)
+        gnums = [o.get("gNumber") for o in day_orders]
+        print(f"DEBUG unique gNumber: {len(set(gnums))}, total gNumber: {len(gnums)}")
+
+        # Count by warehouse
+        wh_counts = Counter(o.get("warehouseName") for o in day_orders)
+        print(f"DEBUG orders by warehouse: {dict(wh_counts)}")
+
+        # Check if same nmId appears multiple times (different warehouses)
+        nmid_counts = Counter(o.get("nmId") for o in day_orders)
+        dupes = {k: v for k, v in nmid_counts.items() if v > 1}
+        print(f"DEBUG nmIds with >1 order: {len(dupes)} SKUs, examples: {dict(list(dupes.items())[:5])}")
+
+        # Revenue comparison
+        rev_total = sum(o.get("totalPrice", 0) for o in day_orders)
+        rev_disc = sum(o.get("priceWithDisc", 0) for o in day_orders)
+        rev_fin = sum(o.get("finishedPrice", 0) for o in day_orders)
+        print(f"DEBUG revenue for {yesterday}: totalPrice={rev_total} priceWithDisc={rev_disc} finishedPrice={rev_fin}")
 
     report_date = find_report_date(orders, sales)
     if not report_date:
