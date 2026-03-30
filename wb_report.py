@@ -210,7 +210,6 @@ def aggregate_metrics(
         if sku not in today_metrics:
             today_metrics[sku] = {"name": name, "orders": 0, "sales": 0, "cancellations": 0, "revenue": 0.0}
         today_metrics[sku]["orders"] += 1
-        # priceWithDisc = цена после скидки продавца, до СПП (≈ кабинет WB)
         today_metrics[sku]["revenue"] += order.get("priceWithDisc", 0)
 
     for sale in sales:
@@ -299,7 +298,6 @@ def generate_report_png(
     fig = plt.figure(figsize=(13, 15), dpi=150, facecolor="white")
     gs = fig.add_gridspec(4, 1, height_ratios=[0.8, 2.5, 3, 2], hspace=0.35)
 
-    # ── HEADER ──────────────────────────────────────────────────────────
     ax_h = fig.add_subplot(gs[0])
     ax_h.axis("off")
     ax_h.text(
@@ -313,7 +311,6 @@ def generate_report_png(
         color="white",
     )
 
-    # ── KPI CARDS ────────────────────────────────────────────────────────
     ax_k = fig.add_subplot(gs[1])
     ax_k.axis("off")
     ax_k.set_xlim(0, 4)
@@ -337,7 +334,6 @@ def generate_report_png(
                   fontsize=16, ha="center", va="center",
                   fontfamily="DejaVu Sans", color="white", fontweight="bold")
 
-    # ── TABLE ────────────────────────────────────────────────────────────
     ax_t = fig.add_subplot(gs[2])
     ax_t.axis("off")
 
@@ -386,7 +382,6 @@ def generate_report_png(
                         cell.set_text_props(color=hex_to_rgb(COLORS["warning_text"]), fontweight="bold")
             cell.set_text_props(fontfamily="DejaVu Sans")
 
-    # ── 7-DAY TREND ──────────────────────────────────────────────────────
     ax_c = fig.add_subplot(gs[3])
     x = np.arange(len(dates_7d))
     w = 0.35
@@ -447,6 +442,36 @@ async def main():
     yesterday_str = str(yesterday)
     headers_auth = {"Authorization": f"Bearer {WB_TOKEN}"}
 
+    # Сначала получаем ВСЕ nmIDs через Content API
+    print(f"\n=== DEBUG: Content API — get all nmIDs ===")
+    await asyncio.sleep(62)  # rate limit
+    all_nm_ids = []
+    cursor = {"limit": 100, "updatedAt": None, "nmID": None}
+    for page in range(20):
+        body = {"settings": {"cursor": cursor, "filter": {"withPhoto": -1}}}
+        try:
+            cr = requests.post(
+                "https://content-api.wildberries.ru/content/v2/get/cards/list",
+                headers=headers_auth, json=body, timeout=30)
+            if not cr.ok:
+                print(f"  Content API error: {cr.status_code} {cr.text[:200]}")
+                break
+            cdata = cr.json()
+            cards = cdata.get("cards", [])
+            if not cards:
+                break
+            for c in cards:
+                nm = c.get("nmID")
+                if nm:
+                    all_nm_ids.append(nm)
+            cursor = cdata.get("cursor", {})
+            if not cursor.get("nmID"):
+                break
+        except Exception as e:
+            print(f"  Content API exception: {e}")
+            break
+    print(f"  Total nmIDs from Content API: {len(all_nm_ids)}")
+
     print(f"\n=== DEBUG: Sales Funnel history for {yesterday} ===")
     await asyncio.sleep(62)  # rate limit
 
@@ -456,7 +481,7 @@ async def main():
             "start": yesterday_str,
             "end": yesterday_str,
         },
-        "nmIds": [],
+        "nmIds": all_nm_ids,
         "skipDeletedNm": True,
         "aggregationLevel": "day",
     }
@@ -495,7 +520,7 @@ async def main():
 
             print(f"\n  ИТОГО: orders={total_orders} sum={total_order_sum:.0f}")
             print(f"         buyouts={total_buyouts} buyout_sum={total_buyout_sum:.0f}")
-            print(f"  (кабинет: 56 заказов, ~102908₽)")
+            print(f"  (кабинет: 56 заказов)")
 
             if total_orders > 0:
                 print("  *** SALES FUNNEL РАБОТАЕТ! ***")
