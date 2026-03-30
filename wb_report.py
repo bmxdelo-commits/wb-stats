@@ -438,42 +438,56 @@ async def main():
     orders, sales, remains = await fetch_all_data(WB_TOKEN, date_from)
     print(f"Got {len(orders)} orders, {len(sales)} sales, {len(remains)} SKUs in stock")
 
-    # DEBUG: analyse order count discrepancy (API=44 vs cabinet=56)
-    if orders:
-        o = orders[0]
-        print(f"DEBUG first order keys: {list(o.keys())}")
-        print(f"DEBUG first order: nmId={o.get('nmId')} totalPrice={o.get('totalPrice')} "
-              f"priceWithDisc={o.get('priceWithDisc')} finishedPrice={o.get('finishedPrice')} "
-              f"spp={o.get('spp')} isCancel={o.get('isCancel')}")
+    # DEBUG: try flag=1 for yesterday (returns all orders for that specific day)
+    yesterday = (datetime.now(MSK) - timedelta(days=1)).date()
+    yesterday_dt = datetime.combine(yesterday, datetime.min.time()).replace(tzinfo=MSK)
+    print(f"\nDEBUG: Trying flag=1 for {yesterday} ...")
+    flag1_url = f"{STATS_HOST}/api/v1/supplier/orders"
+    flag1_resp = requests.get(flag1_url,
+        headers={"Authorization": f"Bearer {WB_TOKEN}"},
+        params={"dateFrom": yesterday_dt.isoformat(), "flag": 1}, timeout=30)
+    flag1_orders = flag1_resp.json() if flag1_resp.ok else []
+    print(f"DEBUG flag=1 orders for {yesterday}: {len(flag1_orders)} records")
 
-        # Count orders for yesterday by different methods
+    # Count from flag=0 data filtered by date
+    day_orders_f0 = [o for o in orders if parse_date(o.get("date")) and parse_date(o.get("date")).date() == yesterday]
+    print(f"DEBUG flag=0 orders for {yesterday}: {len(day_orders_f0)} records")
+
+    # DEBUG: try reportDetailByPeriod (financial report)
+    print(f"\nDEBUG: Trying /api/v5/supplier/reportDetailByPeriod ...")
+    report_url = "https://statistics-api.wildberries.ru/api/v5/supplier/reportDetailByPeriod"
+    report_resp = requests.get(report_url,
+        headers={"Authorization": f"Bearer {WB_TOKEN}"},
+        params={"dateFrom": yesterday.isoformat(), "dateTo": yesterday.isoformat()},
+        timeout=60)
+    print(f"DEBUG reportDetailByPeriod status: {report_resp.status_code}")
+    if report_resp.ok:
+        report_data = report_resp.json()
+        if isinstance(report_data, list):
+            print(f"DEBUG reportDetailByPeriod: {len(report_data)} rows")
+            if report_data:
+                r = report_data[0]
+                print(f"DEBUG report first row keys: {list(r.keys())}")
+                # Show some key fields
+                for key in ['order_dt', 'sale_dt', 'quantity', 'retail_amount',
+                            'retail_price', 'commission_percent', 'supplier_oper_name',
+                            'nm_id', 'sa_name', 'ts_name', 'delivery_amount', 'return_amount']:
+                    if key in r:
+                        print(f"  {key} = {r[key]}")
+        else:
+            print(f"DEBUG reportDetailByPeriod response type: {type(report_data)}")
+            print(f"DEBUG reportDetailByPeriod: {str(report_data)[:500]}")
+    else:
+        print(f"DEBUG reportDetailByPeriod error: {report_resp.text[:300]}")
+
+    # DEBUG: also try /api/v1/supplier/orders with flag=1 and count by warehouseName
+    if flag1_orders:
         from collections import Counter
-        yesterday = (datetime.now(MSK) - timedelta(days=1)).date()
-        day_orders = [o for o in orders if parse_date(o.get("date")) and parse_date(o.get("date")).date() == yesterday]
-        print(f"DEBUG orders for {yesterday}: {len(day_orders)} records")
-
-        # Check unique srid (order line ID)
-        srids = [o.get("srid") for o in day_orders]
-        print(f"DEBUG unique srid: {len(set(srids))}, total srid: {len(srids)}")
-
-        # Check unique gNumber (group number = one customer order)
-        gnums = [o.get("gNumber") for o in day_orders]
-        print(f"DEBUG unique gNumber: {len(set(gnums))}, total gNumber: {len(gnums)}")
-
-        # Count by warehouse
-        wh_counts = Counter(o.get("warehouseName") for o in day_orders)
-        print(f"DEBUG orders by warehouse: {dict(wh_counts)}")
-
-        # Check if same nmId appears multiple times (different warehouses)
-        nmid_counts = Counter(o.get("nmId") for o in day_orders)
-        dupes = {k: v for k, v in nmid_counts.items() if v > 1}
-        print(f"DEBUG nmIds with >1 order: {len(dupes)} SKUs, examples: {dict(list(dupes.items())[:5])}")
-
-        # Revenue comparison
-        rev_total = sum(o.get("totalPrice", 0) for o in day_orders)
-        rev_disc = sum(o.get("priceWithDisc", 0) for o in day_orders)
-        rev_fin = sum(o.get("finishedPrice", 0) for o in day_orders)
-        print(f"DEBUG revenue for {yesterday}: totalPrice={rev_total} priceWithDisc={rev_disc} finishedPrice={rev_fin}")
+        wh = Counter(o.get("warehouseName") for o in flag1_orders)
+        print(f"\nDEBUG flag=1 by warehouse: {dict(wh)}")
+        rev_disc_f1 = sum(o.get("priceWithDisc", 0) for o in flag1_orders)
+        rev_fin_f1 = sum(o.get("finishedPrice", 0) for o in flag1_orders)
+        print(f"DEBUG flag=1 revenue: priceWithDisc={rev_disc_f1:.2f} finishedPrice={rev_fin_f1:.2f}")
 
     report_date = find_report_date(orders, sales)
     if not report_date:
