@@ -435,73 +435,65 @@ async def main():
     orders, sales, remains = await fetch_all_data(WB_TOKEN, date_from)
     print(f"Got {len(orders)} orders, {len(sales)} sales, {len(remains)} SKUs in stock")
 
-    # ===== DEBUG: nmReportDetailHistory — аналитика продавца (ordersCount) =====
+    # ===== DEBUG: nm-report — пробуем несколько путей и хостов =====
     yesterday = (datetime.now(MSK) - timedelta(days=1)).date()
-    print(f"\n=== DEBUG: nmReportDetailHistory for {yesterday} ===")
-    await asyncio.sleep(62)  # rate limit
-    try:
-        nm_url = f"{ANALYT_HOST}/api/v2/nm-report/detail/history"
-        nm_body = {
-            "nmIDs": [],
-            "period": {
-                "begin": f"{yesterday}T00:00:00.000Z",
-                "end": f"{yesterday}T23:59:59.000Z",
-            },
-            "timezone": "Europe/Moscow",
-            "aggregationLevel": "day",
-        }
-        nm_resp = requests.post(nm_url,
-            headers={"Authorization": f"Bearer {WB_TOKEN}"},
-            json=nm_body, timeout=60)
-        print(f"Status: {nm_resp.status_code}")
-        if nm_resp.ok:
-            nm_data = nm_resp.json()
-            print(f"Response keys: {list(nm_data.keys()) if isinstance(nm_data, dict) else type(nm_data)}")
+    print(f"\n=== DEBUG: nm-report for {yesterday} ===")
+    nm_body = {
+        "nmIDs": [],
+        "period": {
+            "begin": f"{yesterday}T00:00:00.000Z",
+            "end": f"{yesterday}T23:59:59.000Z",
+        },
+        "timezone": "Europe/Moscow",
+        "aggregationLevel": "day",
+    }
+    headers_auth = {"Authorization": f"Bearer {WB_TOKEN}"}
 
-            cards = nm_data.get("data", []) if isinstance(nm_data, dict) else []
-            print(f"Cards in response: {len(cards)}")
+    paths = [
+        f"{ANALYT_HOST}/api/v2/nm-report/detail",
+        f"{ANALYT_HOST}/api/v2/nm-report/detail/history",
+        f"{ANALYT_HOST}/api/v1/nm-report/detail",
+        f"{ANALYT_HOST}/api/v1/nm-report/detail/history",
+    ]
 
-            total_orders_nm = 0
-            total_orders_sum = 0
-            total_buyouts = 0
-            total_buyouts_sum = 0
-            total_cancels_nm = 0
+    for path in paths:
+        await asyncio.sleep(3)
+        print(f"\nPOST {path}")
+        try:
+            resp = requests.post(path, headers=headers_auth, json=nm_body, timeout=30)
+            print(f"  Status: {resp.status_code}")
+            if resp.ok:
+                data = resp.json()
+                print(f"  Keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
+                cards = data.get("data", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                print(f"  Items: {len(cards)}")
 
-            for card in cards:
-                history = card.get("history", [])
-                for day in history:
-                    total_orders_nm += day.get("ordersCount", 0)
-                    total_orders_sum += day.get("ordersSumRub", 0)
-                    total_buyouts += day.get("buyoutsCount", 0)
-                    total_buyouts_sum += day.get("buyoutsSumRub", 0)
-                    total_cancels_nm += day.get("cancelCount", 0)
+                total_ord = 0
+                total_sum = 0
+                for card in cards:
+                    if isinstance(card, dict):
+                        hist = card.get("history", [])
+                        if hist:
+                            for day in hist:
+                                total_ord += day.get("ordersCount", 0)
+                                total_sum += day.get("ordersSumRub", 0)
+                        else:
+                            total_ord += card.get("ordersCount", 0)
+                            total_sum += card.get("ordersSumRub", 0)
 
-            print(f"\nИТОГО nmReportDetailHistory:")
-            print(f"  ordersCount = {total_orders_nm}  (кабинет = 56)")
-            print(f"  ordersSumRub = {total_orders_sum:.2f}  (кабинет ≈ 102,908)")
-            print(f"  buyoutsCount = {total_buyouts}")
-            print(f"  buyoutsSumRub = {total_buyouts_sum:.2f}")
-            print(f"  cancelCount = {total_cancels_nm}")
+                print(f"  ИТОГО: orders={total_ord} (кабинет=56) sum={total_sum:.2f} (кабинет≈102908)")
 
-            card_orders = []
-            for card in cards:
-                nm_id = card.get("nmID")
-                for day in card.get("history", []):
-                    oc = day.get("ordersCount", 0)
-                    os = day.get("ordersSumRub", 0)
-                    if oc > 0:
-                        card_orders.append((nm_id, oc, os))
-            card_orders.sort(key=lambda x: x[1], reverse=True)
-            print(f"\nТоп-5 по заказам:")
-            for nm_id, oc, os in card_orders[:5]:
-                print(f"  nmID={nm_id} orders={oc} sum={os:.2f}")
+                if cards and isinstance(cards[0], dict):
+                    print(f"  First card keys: {list(cards[0].keys())[:15]}")
 
-            if nm_data.get("error"):
-                print(f"API error: {nm_data.get('error')}")
-        else:
-            print(f"Error: {nm_resp.text[:500]}")
-    except Exception as e:
-        print(f"nmReportDetailHistory error: {e}")
+                if total_ord > 0:
+                    print("  *** ЭТОТ ПУТЬ РАБОТАЕТ! ***")
+                    break
+            else:
+                err = resp.text[:150].replace('\n', ' ')
+                print(f"  Error: {err}")
+        except Exception as e:
+            print(f"  Error: {e}")
 
     print("\n=== END DEBUG ===")
 
