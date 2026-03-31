@@ -143,7 +143,9 @@ class FunnelProduct:
     buyout_count: int     # штуки выкупов
     buyout_sum: float     # сумма выкупов
     cancel_count: int     # отмены
-    history: List[Dict]   # [{dt, orderCount, orderSum, buyoutCount, buyoutSum}, ...]
+    views: int            # просмотры карточки
+    cart_adds: int        # добавления в корзину
+    history: List[Dict]   # [{dt, orderCount, orderSum, buyoutCount, buyoutSum, openCardCount, ...}, ...]
 
 
 async def get_sales_funnel(
@@ -185,6 +187,8 @@ async def get_sales_funnel(
                 total_buyouts = sum(d.get("buyoutCount", 0) for d in history)
                 total_buyout_sum = sum(d.get("buyoutSum", 0) for d in history)
                 total_cancels = sum(d.get("cancelCount", 0) for d in history)
+                total_views = sum(d.get("openCardCount", 0) for d in history)
+                total_carts = sum(d.get("addToCartCount", 0) for d in history)
 
                 if total_orders > 0 or total_buyouts > 0:
                     results.append(FunnelProduct(
@@ -195,6 +199,8 @@ async def get_sales_funnel(
                         buyout_count=total_buyouts,
                         buyout_sum=total_buyout_sum,
                         cancel_count=total_cancels,
+                        views=total_views,
+                        cart_adds=total_carts,
                         history=history,
                     ))
 
@@ -262,6 +268,48 @@ class ProductMetrics:
     days_remaining: int
 
 
+@dataclass
+class DaySummary:
+    """Итоги за один день (для сравнения вчера vs позавчера)."""
+    orders: int = 0
+    sales: int = 0
+    cancels: int = 0
+    revenue: float = 0.0
+    views: int = 0
+    cart_adds: int = 0
+
+
+def get_day_summaries(
+    funnel: List[FunnelProduct], report_date_str: str,
+) -> Tuple[DaySummary, DaySummary]:
+    """Возвращает (вчера, позавчера) для сравнения."""
+    report_dt = datetime.strptime(report_date_str, "%Y-%m-%d").date()
+    prev_date_str = (report_dt - timedelta(days=1)).isoformat()
+
+    today = DaySummary()
+    prev = DaySummary()
+
+    for prod in funnel:
+        for day in prod.history:
+            dt = day.get("dt", "")[:10]
+            if dt == report_date_str:
+                today.orders += day.get("orderCount", 0)
+                today.sales += day.get("buyoutCount", 0)
+                today.cancels += day.get("cancelCount", 0)
+                today.revenue += day.get("orderSum", 0)
+                today.views += day.get("openCardCount", 0)
+                today.cart_adds += day.get("addToCartCount", 0)
+            elif dt == prev_date_str:
+                prev.orders += day.get("orderCount", 0)
+                prev.sales += day.get("buyoutCount", 0)
+                prev.cancels += day.get("cancelCount", 0)
+                prev.revenue += day.get("orderSum", 0)
+                prev.views += day.get("openCardCount", 0)
+                prev.cart_adds += day.get("addToCartCount", 0)
+
+    return today, prev
+
+
 def build_metrics_from_funnel(
     funnel: List[FunnelProduct],
     remains: Dict[int, int],
@@ -271,17 +319,15 @@ def build_metrics_from_funnel(
     result = []
 
     for prod in funnel:
-        # Данные за report_date
         day_orders = 0
         day_order_sum = 0.0
         day_buyouts = 0
         day_cancels = 0
 
-        # Данные за все дни (для velocity)
         total_orders_all_days = prod.order_count
 
         for day in prod.history:
-            dt = day.get("dt", "")[:10]  # "2026-03-30"
+            dt = day.get("dt", "")[:10]
             if dt == report_date:
                 day_orders = day.get("orderCount", 0)
                 day_order_sum = day.get("orderSum", 0)
@@ -292,7 +338,6 @@ def build_metrics_from_funnel(
             continue
 
         stock_qty = remains.get(prod.nm_id, 0)
-        # velocity: средние заказы в день за период funnel (7 дней)
         num_days = len(prod.history) if prod.history else 7
         avg_daily = total_orders_all_days / max(num_days, 1)
         days_rem = int(stock_qty / avg_daily) if avg_daily > 0 else 9999
@@ -345,6 +390,29 @@ def get_7day_trend_from_funnel(
 
 # ===================== HTML REPORT =====================
 
+def _delta_html(current: int, previous: int) -> str:
+    """Стрелка с процентом изменения: ↑12% или ↓5%."""
+    if previous == 0:
+        return ""
+    pct = (current - previous) / previous * 100
+    if abs(pct) < 1:
+        return '<span style="color:var(--text-muted);font-size:12px"> →0%</span>'
+    if pct > 0:
+        return f'<span style="color:var(--accent-green);font-size:12px"> ↑{pct:.0f}%</span>'
+    return f'<span style="color:var(--accent-red);font-size:12px"> ↓{abs(pct):.0f}%</span>'
+
+
+def _delta_html_float(current: float, previous: float) -> str:
+    if previous == 0:
+        return ""
+    pct = (current - previous) / previous * 100
+    if abs(pct) < 1:
+        return '<span style="color:var(--text-muted);font-size:12px"> →0%</span>'
+    if pct > 0:
+        return f'<span style="color:var(--accent-green);font-size:12px"> ↑{pct:.0f}%</span>'
+    return f'<span style="color:var(--accent-red);font-size:12px"> ↓{abs(pct):.0f}%</span>'
+
+
 def build_html_report(
     metrics: List[ProductMetrics],
     report_date: datetime,
@@ -355,6 +423,8 @@ def build_html_report(
     dates_7d: List[str],
     orders_7d: List[int],
     sales_7d: List[int],
+    today_summary: Optional['DaySummary'] = None,
+    prev_summary: Optional['DaySummary'] = None,
 ) -> str:
 
     # Table rows
@@ -387,6 +457,13 @@ def build_html_report(
     chart_labels = json.dumps(dates_7d, ensure_ascii=False)
     chart_orders = json.dumps(orders_7d)
     chart_sales = json.dumps(sales_7d)
+
+    # Дельты (вчера vs позавчера)
+    orders_delta = _delta_html(orders_count, prev_summary.orders) if prev_summary else ""
+    sales_delta = _delta_html(sales_count, prev_summary.sales) if prev_summary else ""
+    cancel_delta = _delta_html(cancellations, prev_summary.cancels) if prev_summary else ""
+    revenue_delta = _delta_html_float(revenue, prev_summary.revenue) if prev_summary else ""
+    buyout_pct = round(sales_count / orders_count * 100) if orders_count > 0 else 0
 
     date_full = format_date_full(report_date)
     time_now = datetime.now(MSK).strftime("%H:%M")
@@ -446,7 +523,7 @@ body {{
 }}
 .header-badge .dot {{ width: 6px; height: 6px; background: var(--accent-green); border-radius: 50%; }}
 
-.kpi-row {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 16px; }}
+.kpi-row {{ display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 16px; }}
 .kpi-card {{
   background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius);
   padding: 20px; position: relative; overflow: hidden;
@@ -536,22 +613,27 @@ tbody tr.alt {{ background: var(--bg-table-alt); }}
     <div class="kpi-card blue">
       <div class="kpi-icon">📦</div>
       <div class="kpi-label">Заказы</div>
-      <div class="kpi-value">{orders_count}</div>
+      <div class="kpi-value">{orders_count}{orders_delta}</div>
     </div>
     <div class="kpi-card green">
       <div class="kpi-icon">✅</div>
-      <div class="kpi-label">Продажи</div>
-      <div class="kpi-value">{sales_count}</div>
+      <div class="kpi-label">Выкупы</div>
+      <div class="kpi-value">{sales_count}{sales_delta}</div>
     </div>
     <div class="kpi-card red">
       <div class="kpi-icon">↩️</div>
       <div class="kpi-label">Отмены</div>
-      <div class="kpi-value">{cancellations}</div>
+      <div class="kpi-value">{cancellations}{cancel_delta}</div>
     </div>
     <div class="kpi-card amber">
       <div class="kpi-icon">💰</div>
       <div class="kpi-label">Выручка</div>
-      <div class="kpi-value">{fmt_number(revenue)} ₽</div>
+      <div class="kpi-value">{fmt_number(revenue)} ₽{revenue_delta}</div>
+    </div>
+    <div class="kpi-card {'green' if buyout_pct >= 50 else 'amber' if buyout_pct >= 30 else 'red'}">
+      <div class="kpi-icon">📊</div>
+      <div class="kpi-label">% выкупа</div>
+      <div class="kpi-value">{buyout_pct}%</div>
     </div>
   </div>
 
@@ -778,6 +860,9 @@ async def main():
 
         print(f"Orders={total_orders} Sales={total_sales} Cancels={total_cancels} Revenue={total_revenue:.2f} ₽")
 
+        # Сравнение вчера vs позавчера
+        today_summary, prev_summary = get_day_summaries(funnel, report_date_str)
+
         dates_7d, orders_7d, sales_7d = get_7day_trend_from_funnel(funnel, report_date_str)
 
         print("Building HTML report ...")
@@ -785,18 +870,29 @@ async def main():
             metrics, report_date,
             total_orders, total_sales, total_cancels, total_revenue,
             dates_7d, orders_7d, sales_7d,
+            today_summary, prev_summary,
         )
 
         print("Converting HTML → PNG ...")
         png_bytes = await html_to_png(html)
         print(f"PNG size: {len(png_bytes):,} bytes")
 
+        # Low stock предупреждения
+        low_stock = [m for m in metrics if 0 < m.days_remaining <= 7]
+        low_stock_text = ""
+        if low_stock:
+            items = ", ".join(f"{m.name[:20]} ({m.days_remaining}д)" for m in low_stock[:5])
+            low_stock_text = f"\n\n⚠️ Заканчивается: {items}"
+
+        buyout_pct = round(total_sales / total_orders * 100) if total_orders > 0 else 0
+
         caption = (
             f"📊 WB отчёт — {format_date_ru(report_date)}\n\n"
-            f"Заказы: {total_orders}\n"
-            f"Продажи: {total_sales}\n"
-            f"Отмены: {total_cancels}\n"
-            f"Выручка: {fmt_number(total_revenue)} ₽"
+            f"📦 Заказы: {total_orders}\n"
+            f"✅ Выкупы: {total_sales} ({buyout_pct}%)\n"
+            f"↩️ Отмены: {total_cancels}\n"
+            f"💰 Выручка: {fmt_number(total_revenue)} ₽"
+            f"{low_stock_text}"
         )
 
         print("Sending to Telegram ...")
