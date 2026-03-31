@@ -1,0 +1,29 @@
+name: WB API Debug
+
+on:
+  workflow_dispatch:
+    # Запуск вручную — кнопка "Run workflow" на GitHub
+
+jobs:
+  debug:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v5
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run API debug
+        env:
+          WB_TOKEN:     ${{ secrets.WB_TOKEN }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID:   ${{ secrets.TG_CHAT_ID }}
+        run: python wb_api_debug.py
