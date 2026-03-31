@@ -152,138 +152,183 @@ async def get_sales_funnel(
     wb_token: str, date_from: str, date_to: str, nm_ids: List[int] = None
 ) -> List[FunnelProduct]:
     """
-    NM Report Detail History API — статистика карточек товаров по дням.
-    Возвращает ordersCount (штуки!) и ordersSumRub, совпадающие с кабинетом WB.
+    Получает статистику карточек из WB Analytics API.
+    Пробует два endpoint: nm-report/detail/history и sales-funnel/products/history.
     """
-    headers = {"Authorization": wb_token}
-    url = f"{ANALYT_HOST}/api/v2/nm-report/detail/history"
+    # Попробовать оба endpoint — какой ответит, тот и используем
+    endpoints = [
+        {
+            "name": "nm-report/detail/history",
+            "url": f"{ANALYT_HOST}/api/v2/nm-report/detail/history",
+            "headers": {"Authorization": wb_token},
+            "body": {
+                "nmIDs": [],
+                "period": {"begin": f"{date_from} 00:00:00", "end": f"{date_to} 23:59:59"},
+                "timezone": "Europe/Moscow",
+                "page": 1,
+            },
+        },
+        {
+            "name": "sales-funnel/products/history",
+            "url": f"{ANALYT_HOST}/api/analytics/v3/sales-funnel/products/history",
+            "headers": {"Authorization": f"Bearer {wb_token}"},
+            "body": {
+                "selectedPeriod": {"start": date_from, "end": date_to},
+                "nmIds": nm_ids or [],
+                "skipDeletedNm": True,
+                "aggregationLevel": "day",
+            },
+        },
+    ]
+
+    # Шаг 1: найти работающий endpoint
+    working_ep = None
+    for ep in endpoints:
+        try:
+            print(f"  Trying {ep['name']} ...")
+            resp = requests.post(ep["url"], headers=ep["headers"], json=ep["body"], timeout=30)
+            print(f"  {ep['name']}: HTTP {resp.status_code}")
+            if resp.status_code == 404:
+                print(f"  {ep['name']}: 404 — skipping")
+                continue
+            if resp.status_code == 401 or resp.status_code == 403:
+                print(f"  {ep['name']}: {resp.status_code} — auth failed")
+                print(f"  Response: {resp.text[:300]}")
+                continue
+            if resp.ok:
+                data = resp.json()
+                print(f"  {ep['name']}: OK! Response keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
+                print(f"  First 500 chars: {str(data)[:500]}")
+                working_ep = ep
+                break
+            else:
+                print(f"  {ep['name']}: HTTP {resp.status_code}")
+                print(f"  Response: {resp.text[:300]}")
+        except Exception as e:
+            print(f"  {ep['name']}: Exception: {e}")
+
+    if not working_ep:
+        print("No working analytics endpoint found!")
+        return []
+
+    print(f"\nUsing endpoint: {working_ep['name']}")
+
+    # Шаг 2: загрузить данные через работающий endpoint
     results = []
-    errors = 0
-
-    # Формат дат: "YYYY-MM-DD HH:MM:SS"
-    period_begin = f"{date_from} 00:00:00"
-    period_end = f"{date_to} 23:59:59"
-
-    page = 1
-    max_pages = 10
     all_items_count = 0
 
-    while page <= max_pages:
+    # Парсим первый ответ (уже получен)
+    first_data = data
+    page = 1
+
+    while True:
         if page > 1:
             await asyncio.sleep(6)
-
-        body = {
-            "nmIDs": [],  # пустой = все товары продавца
-            "period": {"begin": period_begin, "end": period_end},
-            "timezone": "Europe/Moscow",
-            "page": page,
-        }
-        try:
-            resp = _request_with_retry(
-                "POST", url, headers=headers, json=body, max_retries=5,
-            )
-            print(f"  [page {page}] HTTP {resp.status_code}")
-
-            if not resp.ok:
-                print(f"  [page {page}] Response: {resp.text[:500]}")
-                errors += 1
+            body = working_ep["body"].copy()
+            if "page" in body:
+                body["page"] = page
+            try:
+                resp = _request_with_retry(
+                    "POST", working_ep["url"], headers=working_ep["headers"],
+                    json=body, max_retries=5,
+                )
+                if not resp.ok:
+                    break
+                current_data = resp.json()
+            except Exception as e:
+                print(f"  [page {page}] Exception: {e}")
                 break
+        else:
+            current_data = first_data
 
-            data = resp.json()
-
-            # Детальный лог первой страницы
+        # Извлекаем items — структура зависит от endpoint
+        items = _extract_items(current_data)
+        if not items:
             if page == 1:
-                print(f"  [page 1] Response keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
-                print(f"  [page 1] Full response (first 800 chars): {str(data)[:800]}")
-
-            # nm-report/detail/history: data.cards[] или data.data[]
-            cards = []
-            if isinstance(data, dict):
-                cards = data.get("data", data.get("cards", []))
-                if isinstance(cards, dict):
-                    cards = cards.get("cards", [])
-            if not cards:
-                if page == 1:
-                    print(f"  [page 1] No cards in response")
-                break
-
-            all_items_count += len(cards)
-            print(f"  [page {page}] {len(cards)} cards")
-
-            for card in cards:
-                nm_id = card.get("nmID", 0)
-                title = card.get("vendorCode", f"SKU {nm_id}")
-
-                # nm-report использует statistics.history[]
-                stats = card.get("statistics", card)
-                history = stats.get("history", [])
-
-                # Нормализуем поля history (nm-report: ordersCount → orderCount и т.д.)
-                normalized_history = []
-                total_orders = 0
-                total_order_sum = 0.0
-                total_buyouts = 0
-                total_buyout_sum = 0.0
-                total_cancels = 0
-                total_views = 0
-                total_carts = 0
-
-                for d in history:
-                    oc = d.get("ordersCount", d.get("orderCount", 0))
-                    os_ = d.get("ordersSumRub", d.get("orderSum", 0))
-                    bc = d.get("buyoutsCount", d.get("buyoutCount", 0))
-                    bs = d.get("buyoutsSumRub", d.get("buyoutSum", 0))
-                    cc = d.get("cancelCount", 0)
-                    vc = d.get("openCardCount", 0)
-                    ac = d.get("addToCartCount", 0)
-                    # Дата: может быть "dt" или "date"
-                    dt_val = d.get("dt", d.get("date", ""))
-
-                    total_orders += oc
-                    total_order_sum += os_
-                    total_buyouts += bc
-                    total_buyout_sum += bs
-                    total_cancels += cc
-                    total_views += vc
-                    total_carts += ac
-
-                    normalized_history.append({
-                        "dt": dt_val,
-                        "orderCount": oc,
-                        "orderSum": os_,
-                        "buyoutCount": bc,
-                        "buyoutSum": bs,
-                        "cancelCount": cc,
-                        "openCardCount": vc,
-                        "addToCartCount": ac,
-                    })
-
-                if total_orders > 0 or total_buyouts > 0:
-                    results.append(FunnelProduct(
-                        nm_id=nm_id,
-                        title=title,
-                        order_count=total_orders,
-                        order_sum=total_order_sum,
-                        buyout_count=total_buyouts,
-                        buyout_sum=total_buyout_sum,
-                        cancel_count=total_cancels,
-                        views=total_views,
-                        cart_adds=total_carts,
-                        history=normalized_history,
-                    ))
-
-            # Если карточек меньше лимита — последняя страница
-            if len(cards) < 100:
-                break
-            page += 1
-
-        except Exception as e:
-            print(f"  [page {page}] Exception: {e}")
-            errors += 1
+                print(f"  No items in response")
             break
 
-    print(f"NM Report: {all_items_count} total cards, {len(results)} with activity, {errors} errors")
+        all_items_count += len(items)
+        print(f"  [page {page}] {len(items)} items")
+
+        for item in items:
+            fp = _parse_funnel_item(item)
+            if fp:
+                results.append(fp)
+
+        if len(items) < 100:
+            break
+        page += 1
+        if page > 10:
+            break
+
+    print(f"Analytics: {all_items_count} total items, {len(results)} with activity")
     return results
+
+
+def _extract_items(data: dict) -> list:
+    """Извлекает список товаров из ответа API (разные форматы)."""
+    if not isinstance(data, dict):
+        return []
+    # nm-report: data.data[] или data.cards[]
+    items = data.get("data", data.get("cards", []))
+    if isinstance(items, dict):
+        items = items.get("cards", items.get("data", []))
+    if isinstance(items, list):
+        return items
+    return []
+
+
+def _parse_funnel_item(item: dict) -> Optional[FunnelProduct]:
+    """Парсит один товар из ответа API (поддерживает оба формата)."""
+    # nm-report формат: {nmID, vendorCode, statistics: {history: [...]}}
+    # sales-funnel формат: {product: {nmId, title}, history: [...]}
+    if "product" in item:
+        prod = item["product"]
+        nm_id = prod.get("nmId", 0)
+        title = prod.get("title", f"SKU {nm_id}")
+        history_raw = item.get("history", [])
+    else:
+        nm_id = item.get("nmID", 0)
+        title = item.get("vendorCode", f"SKU {nm_id}")
+        stats = item.get("statistics", item)
+        history_raw = stats.get("history", [])
+
+    if not history_raw:
+        return None
+
+    normalized = []
+    tot_o = tot_os = tot_b = tot_bs = tot_c = tot_v = tot_a = 0
+
+    for d in history_raw:
+        oc = d.get("ordersCount", d.get("orderCount", 0))
+        os_ = d.get("ordersSumRub", d.get("orderSum", 0))
+        bc = d.get("buyoutsCount", d.get("buyoutCount", 0))
+        bs = d.get("buyoutsSumRub", d.get("buyoutSum", 0))
+        cc = d.get("cancelCount", 0)
+        vc = d.get("openCardCount", 0)
+        ac = d.get("addToCartCount", 0)
+        dt_val = d.get("dt", d.get("date", ""))
+
+        tot_o += oc; tot_os += os_; tot_b += bc; tot_bs += bs
+        tot_c += cc; tot_v += vc; tot_a += ac
+
+        normalized.append({
+            "dt": dt_val, "orderCount": oc, "orderSum": os_,
+            "buyoutCount": bc, "buyoutSum": bs, "cancelCount": cc,
+            "openCardCount": vc, "addToCartCount": ac,
+        })
+
+    if tot_o == 0 and tot_b == 0:
+        return None
+
+    return FunnelProduct(
+        nm_id=nm_id, title=title,
+        order_count=tot_o, order_sum=tot_os,
+        buyout_count=tot_b, buyout_sum=tot_bs,
+        cancel_count=tot_c, views=tot_v, cart_adds=tot_a,
+        history=normalized,
+    )
 
 
 async def get_warehouse_remains(wb_token: str) -> Dict[int, int]:
@@ -899,13 +944,20 @@ async def main():
         print(f"Report date: {format_date_ru(report_date)}")
         print(f"Fetching data for {date_from_str} — {report_date_str} ...")
 
-        # 1. NM Report Detail History — статистика карточек по дням
-        print("Loading NM Report data ...")
-        funnel = await get_sales_funnel(WB_TOKEN, date_from_str, report_date_str, [])
+        # 1. Загружаем каталог товаров (нужен для Sales Funnel fallback)
+        print("Loading product catalog ...")
+        nm_ids = get_all_nm_ids(WB_TOKEN)
+        print(f"Catalog: {len(nm_ids)} products")
+
+        # 2. Аналитика — пробуем nm-report, потом sales-funnel
+        print("Loading analytics data ...")
+        funnel = await get_sales_funnel(WB_TOKEN, date_from_str, report_date_str, nm_ids)
         if not funnel:
             send_telegram_error(
-                f"⚠️ WB отчёт не сформирован: NM Report API не вернул данных.\n"
+                f"⚠️ WB отчёт не сформирован: API аналитики не вернул данных.\n"
                 f"Период: {date_from_str} — {report_date_str}\n"
+                f"Попробовано: nm-report и sales-funnel — оба без результата.\n"
+                f"Возможно нужен Сервисный токен (не Персональный) для работы из облака.\n"
                 f"Подробности в логе GitHub Actions",
                 TG_BOT_TOKEN, TG_CHAT_ID,
             )
