@@ -79,7 +79,7 @@ def _request_with_retry(method: str, url: str, headers: dict, max_retries: int =
     for attempt in range(max_retries):
         resp = requests.request(method, url, headers=headers, **kwargs)
         if resp.status_code == 429 or resp.status_code >= 500:
-            wait = 2 ** attempt
+            wait = min(5 * (2 ** attempt), 60)  # 5, 10, 20, 40, 60
             print(f"HTTP {resp.status_code} — retrying in {wait}s (attempt {attempt + 1}/{max_retries})")
             time.sleep(wait)
             continue
@@ -149,60 +149,119 @@ class FunnelProduct:
 
 
 async def get_sales_funnel(
-    wb_token: str, date_from: str, date_to: str, nm_ids: List[int]
+    wb_token: str, date_from: str, date_to: str, nm_ids: List[int] = None
 ) -> List[FunnelProduct]:
     """
-    Sales Funnel API — возвращает orderCount (штуки!) и orderSum,
-    совпадающие с кабинетом WB.
+    NM Report Detail History API — статистика карточек товаров по дням.
+    Возвращает ordersCount (штуки!) и ordersSumRub, совпадающие с кабинетом WB.
     """
-    headers = {"Authorization": f"Bearer {wb_token}"}
-    url = f"{ANALYT_HOST}/api/analytics/v3/sales-funnel/products/history"
+    headers = {"Authorization": wb_token}
+    url = f"{ANALYT_HOST}/api/nm-report/detail/history"
     results = []
     errors = 0
-    batch_size = 20
 
-    for i in range(0, len(nm_ids), batch_size):
-        batch = nm_ids[i:i + batch_size]
-        batch_num = i // batch_size + 1
+    # Формат дат: "YYYY-MM-DD HH:MM:SS"
+    period_begin = f"{date_from} 00:00:00"
+    period_end = f"{date_to} 23:59:59"
 
-        if i > 0:
-            await asyncio.sleep(3)
+    page = 1
+    max_pages = 10
+    all_items_count = 0
+
+    while page <= max_pages:
+        if page > 1:
+            await asyncio.sleep(6)
 
         body = {
-            "selectedPeriod": {"start": date_from, "end": date_to},
-            "nmIds": batch,
-            "skipDeletedNm": True,
-            "aggregationLevel": "day",
+            "nmIDs": [],  # пустой = все товары продавца
+            "period": {"begin": period_begin, "end": period_end},
+            "timezone": "Europe/Moscow",
+            "page": page,
         }
         try:
-            resp = requests.post(url, headers=headers, json=body, timeout=30)
-            print(f"  [batch {batch_num}] HTTP {resp.status_code}")
+            resp = _request_with_retry(
+                "POST", url, headers=headers, json=body, max_retries=5,
+            )
+            print(f"  [page {page}] HTTP {resp.status_code}")
+
             if not resp.ok:
-                print(f"  [batch {batch_num}] Response: {resp.text[:300]}")
+                print(f"  [page {page}] Response: {resp.text[:500]}")
                 errors += 1
-                continue
+                break
+
             data = resp.json()
-            items = data.get("data", []) if isinstance(data, dict) else []
 
-            if batch_num == 1 and not items:
-                print(f"  [batch 1] Empty data. Full response: {str(data)[:500]}")
+            # Детальный лог первой страницы
+            if page == 1:
+                print(f"  [page 1] Response keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
+                print(f"  [page 1] Full response (first 800 chars): {str(data)[:800]}")
 
-            for item in items:
-                prod = item.get("product", {})
-                history = item.get("history", [])
+            # nm-report/detail/history: data.cards[] или data.data[]
+            cards = []
+            if isinstance(data, dict):
+                cards = data.get("data", data.get("cards", []))
+                if isinstance(cards, dict):
+                    cards = cards.get("cards", [])
+            if not cards:
+                if page == 1:
+                    print(f"  [page 1] No cards in response")
+                break
 
-                total_orders = sum(d.get("orderCount", 0) for d in history)
-                total_order_sum = sum(d.get("orderSum", 0) for d in history)
-                total_buyouts = sum(d.get("buyoutCount", 0) for d in history)
-                total_buyout_sum = sum(d.get("buyoutSum", 0) for d in history)
-                total_cancels = sum(d.get("cancelCount", 0) for d in history)
-                total_views = sum(d.get("openCardCount", 0) for d in history)
-                total_carts = sum(d.get("addToCartCount", 0) for d in history)
+            all_items_count += len(cards)
+            print(f"  [page {page}] {len(cards)} cards")
+
+            for card in cards:
+                nm_id = card.get("nmID", 0)
+                title = card.get("vendorCode", f"SKU {nm_id}")
+
+                # nm-report использует statistics.history[]
+                stats = card.get("statistics", card)
+                history = stats.get("history", [])
+
+                # Нормализуем поля history (nm-report: ordersCount → orderCount и т.д.)
+                normalized_history = []
+                total_orders = 0
+                total_order_sum = 0.0
+                total_buyouts = 0
+                total_buyout_sum = 0.0
+                total_cancels = 0
+                total_views = 0
+                total_carts = 0
+
+                for d in history:
+                    oc = d.get("ordersCount", d.get("orderCount", 0))
+                    os_ = d.get("ordersSumRub", d.get("orderSum", 0))
+                    bc = d.get("buyoutsCount", d.get("buyoutCount", 0))
+                    bs = d.get("buyoutsSumRub", d.get("buyoutSum", 0))
+                    cc = d.get("cancelCount", 0)
+                    vc = d.get("openCardCount", 0)
+                    ac = d.get("addToCartCount", 0)
+                    # Дата: может быть "dt" или "date"
+                    dt_val = d.get("dt", d.get("date", ""))
+
+                    total_orders += oc
+                    total_order_sum += os_
+                    total_buyouts += bc
+                    total_buyout_sum += bs
+                    total_cancels += cc
+                    total_views += vc
+                    total_carts += ac
+
+                    normalized_history.append({
+                        "dt": dt_val,
+                        "orderCount": oc,
+                        "orderSum": os_,
+                        "buyoutCount": bc,
+                        "buyoutSum": bs,
+                        "cancelCount": cc,
+                        "openCardCount": vc,
+                        "addToCartCount": ac,
+                    })
 
                 if total_orders > 0 or total_buyouts > 0:
                     results.append(FunnelProduct(
-                        nm_id=prod.get("nmId", 0),
-                        title=prod.get("title", f"SKU {prod.get('nmId', '?')}"),
+                        nm_id=nm_id,
+                        title=title,
                         order_count=total_orders,
                         order_sum=total_order_sum,
                         buyout_count=total_buyouts,
@@ -210,21 +269,20 @@ async def get_sales_funnel(
                         cancel_count=total_cancels,
                         views=total_views,
                         cart_adds=total_carts,
-                        history=history,
+                        history=normalized_history,
                     ))
 
-            batch_orders = sum(
-                d.get("orderCount", 0)
-                for item in items for d in item.get("history", [])
-            )
-            if batch_orders > 0:
-                print(f"  [batch {batch_num}] +{batch_orders} orders")
+            # Если карточек меньше лимита — последняя страница
+            if len(cards) < 100:
+                break
+            page += 1
 
         except Exception as e:
-            print(f"  [batch {batch_num}] Exception: {e}")
+            print(f"  [page {page}] Exception: {e}")
             errors += 1
+            break
 
-    print(f"Sales Funnel: {len(results)} products with activity, {errors} errors")
+    print(f"NM Report: {all_items_count} total cards, {len(results)} with activity, {errors} errors")
     return results
 
 
@@ -841,22 +899,14 @@ async def main():
         print(f"Report date: {format_date_ru(report_date)}")
         print(f"Fetching data for {date_from_str} — {report_date_str} ...")
 
-        # 1. Получаем все nmId из Content API
-        print("Loading product catalog ...")
-        nm_ids = get_all_nm_ids(WB_TOKEN)
-        if not nm_ids:
-            send_telegram_error("⚠️ WB отчёт не сформирован: не удалось загрузить каталог товаров", TG_BOT_TOKEN, TG_CHAT_ID)
-            return
-
-        # 2. Sales Funnel API — точные штуки и суммы (= кабинет WB)
-        print("Loading Sales Funnel data ...")
-        funnel = await get_sales_funnel(WB_TOKEN, date_from_str, report_date_str, nm_ids)
+        # 1. NM Report Detail History — статистика карточек по дням
+        print("Loading NM Report data ...")
+        funnel = await get_sales_funnel(WB_TOKEN, date_from_str, report_date_str, [])
         if not funnel:
             send_telegram_error(
-                f"⚠️ WB отчёт не сформирован: Sales Funnel API не вернул данных.\n"
+                f"⚠️ WB отчёт не сформирован: NM Report API не вернул данных.\n"
                 f"Период: {date_from_str} — {report_date_str}\n"
-                f"nmIds: {len(nm_ids)}\n"
-                f"Проверь: токен должен иметь доступ к разделу 'Аналитика' в кабинете WB",
+                f"Подробности в логе GitHub Actions",
                 TG_BOT_TOKEN, TG_CHAT_ID,
             )
             return
@@ -868,6 +918,15 @@ async def main():
 
         # 4. Метрики за вчера
         metrics = build_metrics_from_funnel(funnel, remains, report_date_str)
+
+        if not metrics:
+            send_telegram_error(
+                f"⚠️ WB отчёт: за {report_date_str} нет данных по артикулам.\n"
+                f"Sales Funnel вернул {len(funnel)} товаров, но за отчётную дату все orderCount=0.\n"
+                f"Возможно, данные за вчера ещё не появились — попробуй запустить позже.",
+                TG_BOT_TOKEN, TG_CHAT_ID,
+            )
+            return
 
         total_orders = sum(m.orders_today for m in metrics)
         total_sales = sum(m.sales_today for m in metrics)
