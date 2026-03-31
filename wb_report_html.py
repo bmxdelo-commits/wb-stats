@@ -158,6 +158,7 @@ async def get_sales_funnel(
     headers = {"Authorization": f"Bearer {wb_token}"}
     url = f"{ANALYT_HOST}/api/analytics/v3/sales-funnel/products/history"
     results = []
+    errors = 0
     batch_size = 20
 
     for i in range(0, len(nm_ids), batch_size):
@@ -174,9 +175,17 @@ async def get_sales_funnel(
             "aggregationLevel": "day",
         }
         try:
-            resp = _request_with_retry("POST", url, headers=headers, json=body)
+            resp = requests.post(url, headers=headers, json=body, timeout=30)
+            print(f"  [batch {batch_num}] HTTP {resp.status_code}")
+            if not resp.ok:
+                print(f"  [batch {batch_num}] Response: {resp.text[:300]}")
+                errors += 1
+                continue
             data = resp.json()
             items = data.get("data", []) if isinstance(data, dict) else []
+
+            if batch_num == 1 and not items:
+                print(f"  [batch 1] Empty data. Full response: {str(data)[:500]}")
 
             for item in items:
                 prod = item.get("product", {})
@@ -212,9 +221,10 @@ async def get_sales_funnel(
                 print(f"  [batch {batch_num}] +{batch_orders} orders")
 
         except Exception as e:
-            print(f"  [batch {batch_num}] Error: {e}")
+            print(f"  [batch {batch_num}] Exception: {e}")
+            errors += 1
 
-    print(f"Sales Funnel: {len(results)} products with activity")
+    print(f"Sales Funnel: {len(results)} products with activity, {errors} errors")
     return results
 
 
@@ -842,7 +852,13 @@ async def main():
         print("Loading Sales Funnel data ...")
         funnel = await get_sales_funnel(WB_TOKEN, date_from_str, report_date_str, nm_ids)
         if not funnel:
-            send_telegram_error("⚠️ WB отчёт не сформирован: Sales Funnel не вернул данных", TG_BOT_TOKEN, TG_CHAT_ID)
+            send_telegram_error(
+                f"⚠️ WB отчёт не сформирован: Sales Funnel API не вернул данных.\n"
+                f"Период: {date_from_str} — {report_date_str}\n"
+                f"nmIds: {len(nm_ids)}\n"
+                f"Проверь: токен должен иметь доступ к разделу 'Аналитика' в кабинете WB",
+                TG_BOT_TOKEN, TG_CHAT_ID,
+            )
             return
 
         # 3. Остатки на складах
