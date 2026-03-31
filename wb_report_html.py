@@ -189,17 +189,26 @@ async def get_sales_funnel(
             print(f"  [batch {batch_num}/{total_batches}] HTTP {resp.status_code}")
 
             data = resp.json()
-            items = data.get("data", []) if isinstance(data, dict) else []
+            # API может вернуть list напрямую или {"data": [...]}
+            if isinstance(data, list):
+                items = data
+            elif isinstance(data, dict):
+                items = data.get("data", [])
+            else:
+                items = []
 
             # Детальный лог первого батча
             if batch_num == 1:
-                print(f"  [batch 1] Response keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
+                print(f"  [batch 1] type={type(data).__name__}, {len(items)} items")
                 if items:
                     sample = items[0]
                     print(f"  [batch 1] First item keys: {list(sample.keys())}")
                     hist = sample.get("history", [])
                     if hist:
                         print(f"  [batch 1] History[0]: {hist[0]}")
+                    # Суммируем метрики первого товара для диагностики
+                    total_oc = sum(d.get("orderCount", 0) for d in hist)
+                    print(f"  [batch 1] First product orderCount sum: {total_oc}")
                 else:
                     print(f"  [batch 1] No items. Response: {str(data)[:500]}")
 
