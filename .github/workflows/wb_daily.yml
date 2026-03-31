@@ -27,7 +27,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install requests playwright
+          sudo apt-get install -y fonts-noto-color-emoji
+          pip install -r requirements.txt
           playwright install chromium --with-deps
 
       - name: Run WB report
@@ -45,14 +46,4 @@ jobs:
         run: |
           curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TG_CHAT_ID}" \
-            -d text="⚠️ WB отчёт не сформирован. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-
-      - name: Notify Telegram on failure
-        if: failure()
-        env:
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID:   ${{ secrets.TG_CHAT_ID }}
-        run: |
-          curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
-            -d chat_id="${TG_CHAT_ID}" \
-            -d text="⚠️ WB отчёт не сформирован%0AРепозиторий: ${{ github.repository }}%0AЗапуск: ${{ github.run_id }}"
+            -d text="⚠️ WB отчёт не сформирован%0ARun: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

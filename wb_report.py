@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# ⚠️ DEPRECATED — НЕ ИСПОЛЬЗОВАТЬ!
+# Этот скрипт на старом Statistics API (считает строки, а не штуки).
+# Актуальный скрипт: wb_report_html.py (Sales Funnel API).
 
 import matplotlib
 matplotlib.use("Agg")
