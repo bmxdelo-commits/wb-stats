@@ -156,7 +156,7 @@ async def get_sales_funnel(
     Возвращает ordersCount (штуки!) и ordersSumRub, совпадающие с кабинетом WB.
     """
     headers = {"Authorization": wb_token}
-    url = f"{ANALYT_HOST}/api/nm-report/detail/history"
+    url = f"{ANALYT_HOST}/api/v2/nm-report/detail/history"
     results = []
     errors = 0
 
