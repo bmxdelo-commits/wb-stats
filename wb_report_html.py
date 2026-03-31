@@ -267,43 +267,6 @@ def _build_daily_stats(
     return dict(daily)
 
 
-async def get_warehouse_remains(wb_token: str) -> Tuple[Dict[int, int], bool]:
-    """Returns (remains_dict, success_flag). If success_flag is False, stock data is unavailable."""
-    headers = {"Authorization": f"Bearer {wb_token}"}
-    url = f"{ANALYT_HOST}/api/v1/warehouse_remains"
-    try:
-        resp = requests.get(url, headers=headers, timeout=30)
-        resp.raise_for_status()
-        data = resp.json()
-        request_id = data.get("data", {}).get("requestId")
-        if not request_id:
-            print("WARNING: No requestId in warehouse_remains response — stock data unavailable")
-            return {}, False
-
-        for attempt in range(10):
-            await asyncio.sleep(5)
-            resp = _request_with_retry(
-                "GET", f"{ANALYT_HOST}/api/v1/warehouse_remains",
-                headers=headers, params={"requestId": request_id},
-            )
-            data = resp.json()
-            if data.get("data", {}).get("isFinished"):
-                remains = data.get("data", {}).get("warehouseRemains", [])
-                result = {}
-                for item in remains:
-                    sku = item.get("nmId")
-                    qty = item.get("quantityFull", 0)
-                    if sku:
-                        result[sku] = qty
-                return result, True
-
-        print("WARNING: Timeout waiting for warehouse_remains — stock data unavailable")
-        return {}, False
-    except Exception as e:
-        print(f"WARNING: Error fetching warehouse_remains: {e} — stock data unavailable")
-        return {}, False
-
-
 # ===================== DATA LOGIC =====================
 
 @dataclass
@@ -314,8 +277,6 @@ class ProductMetrics:
     sales_today: int        # штуки выкупов
     cancellations_today: int
     revenue_today: float    # priceWithDisc — розничная цена с учётом согл. скидки
-    stock_qty: int
-    days_remaining: int
 
 
 @dataclass
@@ -354,9 +315,7 @@ def get_day_summaries_from_stats(
 
 def build_metrics_from_stats(
     daily_stats: Dict[str, Dict],
-    remains: Dict[int, int],
     report_date: str,
-    num_days: int = 7,
 ) -> List[ProductMetrics]:
     """Собирает метрики из Statistics API за конкретный день."""
     day_data = daily_stats.get(report_date, {})
@@ -365,24 +324,10 @@ def build_metrics_from_stats(
     if not by_nm:
         return []
 
-    # Средний дневной заказ за все дни (для расчёта дней остатка)
-    report_dt = datetime.strptime(report_date, "%Y-%m-%d").date()
-    nm_total_orders = {}
-    for i in range(num_days):
-        d = (report_dt - timedelta(days=i)).isoformat()
-        d_data = daily_stats.get(d, {})
-        for nm_id, nm in d_data.get("by_nm", {}).items():
-            nm_total_orders[nm_id] = nm_total_orders.get(nm_id, 0) + nm.get("orders", 0)
-
     result = []
     for nm_id, nm in by_nm.items():
         if nm["orders"] == 0 and nm["sales"] == 0:
             continue
-
-        stock_qty = remains.get(nm_id, 0)
-        total_orders = nm_total_orders.get(nm_id, 0)
-        avg_daily = total_orders / max(num_days, 1)
-        days_rem = int(stock_qty / avg_daily) if avg_daily > 0 else 9999
 
         result.append(ProductMetrics(
             sku=nm_id,
@@ -391,8 +336,6 @@ def build_metrics_from_stats(
             sales_today=nm["sales"],
             cancellations_today=nm["cancels"],
             revenue_today=nm["revenue"],
-            stock_qty=stock_qty,
-            days_remaining=min(days_rem, 9999),
         ))
 
     return sorted(result, key=lambda x: x.revenue_today, reverse=True)
@@ -459,14 +402,6 @@ def build_html_report(
     # Table rows
     table_rows = ""
     for i, m in enumerate(metrics[:20]):
-        days_str = str(m.days_remaining) if m.days_remaining < 9999 else "—"
-        if m.days_remaining <= 5:
-            days_html = f'<span class="days-badge days-critical">{days_str}</span>'
-        elif m.days_remaining <= 14:
-            days_html = f'<span class="days-badge days-warning">{days_str}</span>'
-        else:
-            days_html = f'<span class="days-badge days-ok">{days_str}</span>'
-
         row_class = ' class="alt"' if i % 2 == 1 else ""
         table_rows += f"""
         <tr{row_class}>
@@ -475,7 +410,6 @@ def build_html_report(
           <td>{m.sales_today}</td>
           <td>{m.cancellations_today}</td>
           <td>{fmt_number(m.revenue_today)} ₽</td>
-          <td>{days_html}</td>
         </tr>"""
 
     # Top-5 for horizontal bar chart
@@ -590,39 +524,6 @@ body {{
 }}
 .chart-wrap {{ position: relative; height: 200px; }}
 
-.table-card {{
-  background: var(--bg-card); border: 1px solid var(--border);
-  border-radius: var(--radius); padding: 20px 24px; margin-bottom: 16px;
-}}
-.table-card h3 {{
-  font-size: 13px; font-weight: 600; color: var(--text-secondary);
-  text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 14px;
-}}
-table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
-thead th {{
-  text-align: left; padding: 10px 14px; font-size: 11px; font-weight: 600;
-  color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.8px;
-  border-bottom: 1px solid var(--border);
-}}
-thead th:not(:first-child) {{ text-align: right; }}
-tbody td {{
-  padding: 11px 14px; border-bottom: 1px solid var(--border); color: var(--text-primary);
-}}
-tbody td:not(:first-child) {{ text-align: right; }}
-tbody td.left {{ font-weight: 600; color: var(--text-primary); }}
-tbody tr:last-child td {{ border-bottom: none; }}
-tbody tr.alt {{ background: var(--bg-table-alt); }}
-.days-badge {{
-  display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: 12px; font-weight: 600;
-}}
-.days-critical {{
-  background: var(--accent-red-bg); color: var(--accent-red); border: 1px solid rgba(239,68,68,0.2);
-}}
-.days-warning {{
-  background: var(--accent-amber-bg); color: var(--accent-amber); border: 1px solid rgba(245,158,11,0.2);
-}}
-.days-ok {{ color: var(--text-secondary); }}
-
 .footer {{
   display: flex; justify-content: space-between; align-items: center;
   padding: 12px 0; font-size: 11px; color: var(--text-muted);
@@ -677,24 +578,6 @@ tbody tr.alt {{ background: var(--bg-table-alt); }}
       <h3>Топ-5 по выручке</h3>
       <div class="chart-wrap"><canvas id="topChart"></canvas></div>
     </div>
-  </div>
-
-  <div class="table-card">
-    <h3>Детализация по артикулам</h3>
-    <table>
-      <thead>
-        <tr>
-          <th>Товар</th>
-          <th>Заказов</th>
-          <th>Продаж</th>
-          <th>Отмен</th>
-          <th>Выручка</th>
-          <th>Остаток дней</th>
-        </tr>
-      </thead>
-      <tbody>{table_rows}
-      </tbody>
-    </table>
   </div>
 
   <div class="footer">
@@ -891,15 +774,8 @@ async def main():
         # 3. Группируем данные по дням
         daily_stats = _build_daily_stats(stat_orders, stat_sales, catalog)
 
-        # 4. Остатки на складах
-        print("Loading warehouse remains ...")
-        remains, warehouse_ok = await get_warehouse_remains(WB_TOKEN)
-        if not warehouse_ok:
-            print("WARNING: Warehouse data failed — stock quantities will show as 0")
-        print(f"Got {len(remains)} SKUs in stock")
-
-        # 5. Метрики за вчера
-        metrics = build_metrics_from_stats(daily_stats, remains, report_date_str)
+        # 4. Метрики за вчера
+        metrics = build_metrics_from_stats(daily_stats, report_date_str)
 
         if not metrics:
             send_telegram_error(
@@ -934,13 +810,6 @@ async def main():
         png_bytes = await html_to_png(html)
         print(f"PNG size: {len(png_bytes):,} bytes")
 
-        # Low stock предупреждения
-        low_stock = [m for m in metrics if 0 < m.days_remaining <= 7]
-        low_stock_text = ""
-        if low_stock:
-            items = ", ".join(f"{m.name[:20]} ({m.days_remaining}д)" for m in low_stock[:5])
-            low_stock_text = f"\n\n⚠️ Заканчивается: {items}"
-
         buyout_pct = round(total_sales / total_orders * 100) if total_orders > 0 else 0
 
         caption = (
@@ -949,7 +818,6 @@ async def main():
             f"✅ Выкупы: {total_sales} ({buyout_pct}%)\n"
             f"↩️ Отмены: {total_cancels}\n"
             f"💰 Выручка: {fmt_number(total_revenue)} ₽"
-            f"{low_stock_text}"
         )
 
         print("Sending to Telegram ...")
