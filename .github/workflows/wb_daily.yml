@@ -33,7 +33,7 @@ jobs:
 
       - name: Run WB report
         env:
-          WB_TOKEN:     ${{ secrets.WB_TOKEN }}
+          WB_TOKEN:     ${{ secrets.WB_TOKEN_NEW }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID:   ${{ secrets.TG_CHAT_ID }}
         run: python wb_report_html.py
