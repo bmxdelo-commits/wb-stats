@@ -18,7 +18,27 @@ from pathlib import Path
 
 # ===================== CONSTANTS =====================
 
+# Chart.js local cache — downloaded once and embedded inline in HTML
+_CHARTJS_CACHE_PATH = Path("/tmp/chart.js.4.5.1.min.js")
+_CHARTJS_CDN_URL = "https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js"
+
+
+def _get_chartjs() -> str:
+    """Return Chart.js source code, downloading and caching if needed."""
+    if _CHARTJS_CACHE_PATH.exists():
+        return _CHARTJS_CACHE_PATH.read_text(encoding="utf-8")
+    try:
+        resp = requests.get(_CHARTJS_CDN_URL, timeout=30)
+        resp.raise_for_status()
+        _CHARTJS_CACHE_PATH.write_text(resp.text, encoding="utf-8")
+        print(f"Chart.js cached at {_CHARTJS_CACHE_PATH}")
+        return resp.text
+    except Exception as e:
+        print(f"WARNING: Failed to download Chart.js: {e}")
+        return ""
+
 ANALYT_HOST = "https://seller-analytics-api.wildberries.ru"
+STATS_HOST = "https://statistics-api.wildberries.ru"
 CONTENT_HOST = "https://content-api.wildberries.ru"
 
 WB_TOKEN = os.getenv("WB_TOKEN", "")
@@ -134,151 +154,121 @@ def get_all_nm_ids(wb_token: str) -> List[int]:
 
 
 @dataclass
-class FunnelProduct:
-    """Данные одного товара из Sales Funnel API."""
+class StatOrder:
+    """Один заказ из Statistics API /orders."""
     nm_id: int
-    title: str
-    order_count: int      # штуки заказов (= кабинет WB)
-    order_sum: float      # сумма заказов (= кабинет WB)
-    buyout_count: int     # штуки выкупов
-    buyout_sum: float     # сумма выкупов
-    cancel_count: int     # отмены
-    views: int            # просмотры карточки
-    cart_adds: int        # добавления в корзину
-    history: List[Dict]   # [{dt, orderCount, orderSum, buyoutCount, buyoutSum, openCardCount, ...}, ...]
+    date: str             # YYYY-MM-DD
+    subject: str          # категория
+    supplier_article: str
+    price_with_disc: float  # розничная цена с учётом согласованной скидки (= кабинет WB)
+    total_price: float    # базовая цена до скидок
+    finished_price: float # финальная цена покупателя (после СПП)
+    is_cancel: bool
+    g_number: str         # номер заказа (группирует товары одного заказа)
 
 
-async def get_sales_funnel(
-    wb_token: str, date_from: str, date_to: str, nm_ids: List[int] = None
-) -> List[FunnelProduct]:
+def get_statistics_orders(wb_token: str, date_from: str) -> List[StatOrder]:
     """
-    Sales Funnel API — батчами по 20 nmIds.
-    Возвращает orderCount (штуки) и orderSum, совпадающие с кабинетом WB.
+    Statistics API /orders — возвращает все заказы начиная с date_from.
+    priceWithDisc = розничная цена с учётом согласованной скидки (совпадает с кабинетом WB).
+    Не включает заказы с неподтверждённой оплатой (рассрочки) — ~20% от реальных.
     """
     headers = {"Authorization": f"Bearer {wb_token}"}
-    url = f"{ANALYT_HOST}/api/analytics/v3/sales-funnel/products/history"
-    results = []
-    errors = 0
-    batch_size = 20
-    ids = nm_ids or []
+    url = f"{STATS_HOST}/api/v1/supplier/orders?dateFrom={date_from}T00:00:00&flag=0"
 
-    if not ids:
-        print("  No nmIds provided — skipping Sales Funnel")
+    try:
+        resp = _request_with_retry("GET", url, headers=headers, max_retries=3)
+        data = resp.json()
+    except Exception as e:
+        print(f"Statistics /orders error: {e}")
         return []
 
-    total_batches = (len(ids) + batch_size - 1) // batch_size
-    print(f"  {len(ids)} products, {total_batches} batches of {batch_size}")
-
-    for i in range(0, len(ids), batch_size):
-        batch = ids[i:i + batch_size]
-        batch_num = i // batch_size + 1
-
-        if i > 0:
-            await asyncio.sleep(6)
-
-        body = {
-            "selectedPeriod": {"start": date_from, "end": date_to},
-            "nmIds": batch,
-            "skipDeletedNm": True,
-            "aggregationLevel": "day",
-        }
-        try:
-            resp = _request_with_retry(
-                "POST", url, headers=headers, json=body, max_retries=5,
-            )
-            print(f"  [batch {batch_num}/{total_batches}] HTTP {resp.status_code}")
-
-            data = resp.json()
-            # API может вернуть list напрямую или {"data": [...]}
-            if isinstance(data, list):
-                items = data
-            elif isinstance(data, dict):
-                items = data.get("data", [])
-            else:
-                items = []
-
-            # Детальный лог первого батча
-            if batch_num == 1:
-                print(f"  [batch 1] type={type(data).__name__}, {len(items)} items")
-                if items:
-                    sample = items[0]
-                    print(f"  [batch 1] First item keys: {list(sample.keys())}")
-                    hist = sample.get("history", [])
-                    if hist:
-                        print(f"  [batch 1] History[0]: {hist[0]}")
-                    # Суммируем метрики первого товара для диагностики
-                    total_oc = sum(d.get("orderCount", 0) for d in hist)
-                    print(f"  [batch 1] First product orderCount sum: {total_oc}")
-                else:
-                    print(f"  [batch 1] No items. Response: {str(data)[:500]}")
-
-            for item in items:
-                fp = _parse_funnel_item(item)
-                if fp:
-                    results.append(fp)
-
-        except Exception as e:
-            print(f"  [batch {batch_num}] Exception: {e}")
-            errors += 1
-
-    print(f"Sales Funnel: {len(results)} products with activity, {errors} errors")
+    results = []
+    for o in data:
+        results.append(StatOrder(
+            nm_id=o.get("nmId", 0),
+            date=o.get("date", "")[:10],
+            subject=o.get("subject", ""),
+            supplier_article=o.get("supplierArticle", ""),
+            price_with_disc=o.get("priceWithDisc", 0),
+            total_price=o.get("totalPrice", 0),
+            finished_price=o.get("finishedPrice", 0),
+            is_cancel=o.get("isCancel", False),
+            g_number=o.get("gNumber", ""),
+        ))
+    print(f"Statistics /orders: {len(results)} records from {date_from}")
     return results
 
 
+def get_statistics_sales(wb_token: str, date_from: str) -> List[Dict]:
+    """
+    Statistics API /sales — возвращает выкупы (продажи) начиная с date_from.
+    """
+    headers = {"Authorization": f"Bearer {wb_token}"}
+    url = f"{STATS_HOST}/api/v1/supplier/sales?dateFrom={date_from}T00:00:00&flag=0"
 
-def _parse_funnel_item(item: dict) -> Optional[FunnelProduct]:
-    """Парсит один товар из ответа API (поддерживает оба формата)."""
-    # nm-report формат: {nmID, vendorCode, statistics: {history: [...]}}
-    # sales-funnel формат: {product: {nmId, title}, history: [...]}
-    if "product" in item:
-        prod = item["product"]
-        nm_id = prod.get("nmId", 0)
-        title = prod.get("title", f"SKU {nm_id}")
-        history_raw = item.get("history", [])
-    else:
-        nm_id = item.get("nmID", 0)
-        title = item.get("vendorCode", f"SKU {nm_id}")
-        stats = item.get("statistics", item)
-        history_raw = stats.get("history", [])
+    try:
+        resp = _request_with_retry("GET", url, headers=headers, max_retries=3)
+        data = resp.json()
+    except Exception as e:
+        print(f"Statistics /sales error: {e}")
+        return []
 
-    if not history_raw:
-        return None
-
-    normalized = []
-    tot_o = tot_os = tot_b = tot_bs = tot_c = tot_v = tot_a = 0
-
-    for d in history_raw:
-        oc = d.get("ordersCount", d.get("orderCount", 0))
-        os_ = d.get("ordersSumRub", d.get("orderSum", 0))
-        bc = d.get("buyoutsCount", d.get("buyoutCount", 0))
-        bs = d.get("buyoutsSumRub", d.get("buyoutSum", 0))
-        cc = d.get("cancelCount", 0)
-        vc = d.get("openCardCount", 0)
-        ac = d.get("addToCartCount", 0)
-        dt_val = d.get("dt", d.get("date", ""))
-
-        tot_o += oc; tot_os += os_; tot_b += bc; tot_bs += bs
-        tot_c += cc; tot_v += vc; tot_a += ac
-
-        normalized.append({
-            "dt": dt_val, "orderCount": oc, "orderSum": os_,
-            "buyoutCount": bc, "buyoutSum": bs, "cancelCount": cc,
-            "openCardCount": vc, "addToCartCount": ac,
-        })
-
-    if tot_o == 0 and tot_b == 0:
-        return None
-
-    return FunnelProduct(
-        nm_id=nm_id, title=title,
-        order_count=tot_o, order_sum=tot_os,
-        buyout_count=tot_b, buyout_sum=tot_bs,
-        cancel_count=tot_c, views=tot_v, cart_adds=tot_a,
-        history=normalized,
-    )
+    print(f"Statistics /sales: {len(data)} records from {date_from}")
+    return data
 
 
-async def get_warehouse_remains(wb_token: str) -> Dict[int, int]:
+def _build_daily_stats(
+    orders: List[StatOrder], sales: List[Dict],
+    catalog: Dict[int, str],
+) -> Dict[str, Dict]:
+    """
+    Группирует заказы и выкупы по дням.
+    Возвращает {date_str: {orders, cancels, revenue, sales, sales_sum, by_nm: {nm_id: {...}}}}.
+    """
+    from collections import defaultdict
+
+    daily = defaultdict(lambda: {
+        "orders": 0, "cancels": 0, "revenue": 0.0,
+        "sales": 0, "sales_sum": 0.0,
+        "by_nm": defaultdict(lambda: {
+            "orders": 0, "cancels": 0, "revenue": 0.0,
+            "sales": 0, "sales_sum": 0.0,
+            "name": "", "subject": "",
+        }),
+    })
+
+    for o in orders:
+        d = daily[o.date]
+        nm = d["by_nm"][o.nm_id]
+        nm["name"] = nm["name"] or catalog.get(o.nm_id, o.supplier_article or f"SKU {o.nm_id}")
+        nm["subject"] = nm["subject"] or o.subject
+        if o.is_cancel:
+            d["cancels"] += 1
+            nm["cancels"] += 1
+        else:
+            d["orders"] += 1
+            d["revenue"] += o.price_with_disc
+            nm["orders"] += 1
+            nm["revenue"] += o.price_with_disc
+
+    for s in sales:
+        dt = s.get("date", "")[:10]
+        nm_id = s.get("nmId", 0)
+        d = daily[dt]
+        d["sales"] += 1
+        d["sales_sum"] += s.get("priceWithDisc", 0)
+        nm = d["by_nm"][nm_id]
+        nm["sales"] += 1
+        nm["sales_sum"] += s.get("priceWithDisc", 0)
+        if not nm["name"]:
+            nm["name"] = catalog.get(nm_id, s.get("supplierArticle", f"SKU {nm_id}"))
+
+    return dict(daily)
+
+
+async def get_warehouse_remains(wb_token: str) -> Tuple[Dict[int, int], bool]:
+    """Returns (remains_dict, success_flag). If success_flag is False, stock data is unavailable."""
     headers = {"Authorization": f"Bearer {wb_token}"}
     url = f"{ANALYT_HOST}/api/v1/warehouse_remains"
     try:
@@ -287,8 +277,8 @@ async def get_warehouse_remains(wb_token: str) -> Dict[int, int]:
         data = resp.json()
         request_id = data.get("data", {}).get("requestId")
         if not request_id:
-            print("No requestId in warehouse_remains response")
-            return {}
+            print("WARNING: No requestId in warehouse_remains response — stock data unavailable")
+            return {}, False
 
         for attempt in range(10):
             await asyncio.sleep(5)
@@ -305,13 +295,13 @@ async def get_warehouse_remains(wb_token: str) -> Dict[int, int]:
                     qty = item.get("quantityFull", 0)
                     if sku:
                         result[sku] = qty
-                return result
+                return result, True
 
-        print("Timeout waiting for warehouse_remains")
-        return {}
+        print("WARNING: Timeout waiting for warehouse_remains — stock data unavailable")
+        return {}, False
     except Exception as e:
-        print(f"Error fetching warehouse_remains: {e}")
-        return {}
+        print(f"WARNING: Error fetching warehouse_remains: {e} — stock data unavailable")
+        return {}, False
 
 
 # ===================== DATA LOGIC =====================
@@ -320,10 +310,10 @@ async def get_warehouse_remains(wb_token: str) -> Dict[int, int]:
 class ProductMetrics:
     sku: int
     name: str
-    orders_today: int       # штуки (из Sales Funnel — совпадает с кабинетом!)
+    orders_today: int       # штуки заказов (из Statistics API)
     sales_today: int        # штуки выкупов
     cancellations_today: int
-    revenue_today: float    # сумма заказов (из Sales Funnel — совпадает с кабинетом!)
+    revenue_today: float    # priceWithDisc — розничная цена с учётом согл. скидки
     stock_qty: int
     days_remaining: int
 
@@ -335,80 +325,72 @@ class DaySummary:
     sales: int = 0
     cancels: int = 0
     revenue: float = 0.0
-    views: int = 0
-    cart_adds: int = 0
 
 
-def get_day_summaries(
-    funnel: List[FunnelProduct], report_date_str: str,
+def get_day_summaries_from_stats(
+    daily_stats: Dict[str, Dict], report_date_str: str,
 ) -> Tuple[DaySummary, DaySummary]:
-    """Возвращает (вчера, позавчера) для сравнения."""
+    """Возвращает (вчера, позавчера) из Statistics API данных."""
     report_dt = datetime.strptime(report_date_str, "%Y-%m-%d").date()
     prev_date_str = (report_dt - timedelta(days=1)).isoformat()
 
     today = DaySummary()
     prev = DaySummary()
 
-    for prod in funnel:
-        for day in prod.history:
-            dt = day.get("dt", "")[:10]
-            if dt == report_date_str:
-                today.orders += day.get("orderCount", 0)
-                today.sales += day.get("buyoutCount", 0)
-                today.cancels += day.get("cancelCount", 0)
-                today.revenue += day.get("orderSum", 0)
-                today.views += day.get("openCardCount", 0)
-                today.cart_adds += day.get("addToCartCount", 0)
-            elif dt == prev_date_str:
-                prev.orders += day.get("orderCount", 0)
-                prev.sales += day.get("buyoutCount", 0)
-                prev.cancels += day.get("cancelCount", 0)
-                prev.revenue += day.get("orderSum", 0)
-                prev.views += day.get("openCardCount", 0)
-                prev.cart_adds += day.get("addToCartCount", 0)
+    d = daily_stats.get(report_date_str, {})
+    today.orders = d.get("orders", 0)
+    today.sales = d.get("sales", 0)
+    today.cancels = d.get("cancels", 0)
+    today.revenue = d.get("revenue", 0.0)
+
+    d = daily_stats.get(prev_date_str, {})
+    prev.orders = d.get("orders", 0)
+    prev.sales = d.get("sales", 0)
+    prev.cancels = d.get("cancels", 0)
+    prev.revenue = d.get("revenue", 0.0)
 
     return today, prev
 
 
-def build_metrics_from_funnel(
-    funnel: List[FunnelProduct],
+def build_metrics_from_stats(
+    daily_stats: Dict[str, Dict],
     remains: Dict[int, int],
     report_date: str,
+    num_days: int = 7,
 ) -> List[ProductMetrics]:
-    """Собирает метрики из Sales Funnel за конкретный день."""
+    """Собирает метрики из Statistics API за конкретный день."""
+    day_data = daily_stats.get(report_date, {})
+    by_nm = day_data.get("by_nm", {})
+
+    if not by_nm:
+        return []
+
+    # Средний дневной заказ за все дни (для расчёта дней остатка)
+    report_dt = datetime.strptime(report_date, "%Y-%m-%d").date()
+    nm_total_orders = {}
+    for i in range(num_days):
+        d = (report_dt - timedelta(days=i)).isoformat()
+        d_data = daily_stats.get(d, {})
+        for nm_id, nm in d_data.get("by_nm", {}).items():
+            nm_total_orders[nm_id] = nm_total_orders.get(nm_id, 0) + nm.get("orders", 0)
+
     result = []
-
-    for prod in funnel:
-        day_orders = 0
-        day_order_sum = 0.0
-        day_buyouts = 0
-        day_cancels = 0
-
-        total_orders_all_days = prod.order_count
-
-        for day in prod.history:
-            dt = day.get("dt", "")[:10]
-            if dt == report_date:
-                day_orders = day.get("orderCount", 0)
-                day_order_sum = day.get("orderSum", 0)
-                day_buyouts = day.get("buyoutCount", 0)
-                day_cancels = day.get("cancelCount", 0)
-
-        if day_orders == 0 and day_buyouts == 0:
+    for nm_id, nm in by_nm.items():
+        if nm["orders"] == 0 and nm["sales"] == 0:
             continue
 
-        stock_qty = remains.get(prod.nm_id, 0)
-        num_days = len(prod.history) if prod.history else 7
-        avg_daily = total_orders_all_days / max(num_days, 1)
+        stock_qty = remains.get(nm_id, 0)
+        total_orders = nm_total_orders.get(nm_id, 0)
+        avg_daily = total_orders / max(num_days, 1)
         days_rem = int(stock_qty / avg_daily) if avg_daily > 0 else 9999
 
         result.append(ProductMetrics(
-            sku=prod.nm_id,
-            name=prod.title,
-            orders_today=day_orders,
-            sales_today=day_buyouts,
-            cancellations_today=day_cancels,
-            revenue_today=day_order_sum,
+            sku=nm_id,
+            name=nm["name"],
+            orders_today=nm["orders"],
+            sales_today=nm["sales"],
+            cancellations_today=nm["cancels"],
+            revenue_today=nm["revenue"],
             stock_qty=stock_qty,
             days_remaining=min(days_rem, 9999),
         ))
@@ -416,34 +398,21 @@ def build_metrics_from_funnel(
     return sorted(result, key=lambda x: x.revenue_today, reverse=True)
 
 
-def get_7day_trend_from_funnel(
-    funnel: List[FunnelProduct], report_date_str: str,
+def get_7day_trend_from_stats(
+    daily_stats: Dict[str, Dict], report_date_str: str,
 ) -> Tuple[List[str], List[int], List[int]]:
-    """Тренд за 7 дней из Sales Funnel history."""
+    """Тренд за 7 дней из Statistics API данных."""
     report_dt = datetime.strptime(report_date_str, "%Y-%m-%d").date()
-
-    # Инициализация 7 дней
-    daily_orders: Dict = {}
-    daily_buyouts: Dict = {}
-    for i in range(7):
-        d = (report_dt - timedelta(days=i)).isoformat()
-        daily_orders[d] = 0
-        daily_buyouts[d] = 0
-
-    for prod in funnel:
-        for day in prod.history:
-            dt = day.get("dt", "")[:10]
-            if dt in daily_orders:
-                daily_orders[dt] += day.get("orderCount", 0)
-                daily_buyouts[dt] += day.get("buyoutCount", 0)
 
     dates, ord_list, sal_list = [], [], []
     for i in range(6, -1, -1):
         d = (report_dt - timedelta(days=i)).isoformat()
         d_short = datetime.strptime(d, "%Y-%m-%d").strftime("%d.%m")
         dates.append(d_short)
-        ord_list.append(daily_orders.get(d, 0))
-        sal_list.append(daily_buyouts.get(d, 0))
+
+        day = daily_stats.get(d, {})
+        ord_list.append(day.get("orders", 0))
+        sal_list.append(day.get("sales", 0))
 
     return dates, ord_list, sal_list
 
@@ -528,13 +497,15 @@ def build_html_report(
     date_full = format_date_full(report_date)
     time_now = datetime.now(MSK).strftime("%H:%M")
 
+    chartjs_src = _get_chartjs()
+
     html = f"""<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>WB Report — {format_date_ru(report_date)}</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1"></script>
+<script>{chartjs_src}</script>
 <style>
 :root {{
   --bg-body: #0f111a;
@@ -891,37 +862,49 @@ async def main():
         print(f"Report date: {format_date_ru(report_date)}")
         print(f"Fetching data for {date_from_str} — {report_date_str} ...")
 
-        # 1. Загружаем каталог товаров (нужен для Sales Funnel fallback)
+        # 1. Каталог товаров (для названий)
         print("Loading product catalog ...")
         nm_ids = get_all_nm_ids(WB_TOKEN)
+        catalog = {}  # nm_id → title (заполним из Content API)
         print(f"Catalog: {len(nm_ids)} products")
 
-        # 2. Аналитика — пробуем nm-report, потом sales-funnel
-        print("Loading analytics data ...")
-        funnel = await get_sales_funnel(WB_TOKEN, date_from_str, report_date_str, nm_ids)
-        if not funnel:
+        # 2. Statistics API — заказы и выкупы
+        print("Loading orders (Statistics API) ...")
+        stat_orders = get_statistics_orders(WB_TOKEN, date_from_str)
+        if not stat_orders:
             send_telegram_error(
-                f"⚠️ WB отчёт не сформирован: API аналитики не вернул данных.\n"
-                f"Период: {date_from_str} — {report_date_str}\n"
-                f"Попробовано: nm-report и sales-funnel — оба без результата.\n"
-                f"Возможно нужен Сервисный токен (не Персональный) для работы из облака.\n"
-                f"Подробности в логе GitHub Actions",
+                f"⚠️ WB отчёт не сформирован: Statistics API не вернул заказов.\n"
+                f"Период: с {date_from_str}\n"
+                f"Подробности в логе.",
                 TG_BOT_TOKEN, TG_CHAT_ID,
             )
             return
 
-        # 3. Остатки на складах
+        print("Loading sales (Statistics API) ...")
+        stat_sales = get_statistics_sales(WB_TOKEN, date_from_str)
+
+        # Строим каталог названий из данных заказов
+        for o in stat_orders:
+            if o.nm_id and o.nm_id not in catalog:
+                catalog[o.nm_id] = o.supplier_article or o.subject or f"SKU {o.nm_id}"
+
+        # 3. Группируем данные по дням
+        daily_stats = _build_daily_stats(stat_orders, stat_sales, catalog)
+
+        # 4. Остатки на складах
         print("Loading warehouse remains ...")
-        remains = await get_warehouse_remains(WB_TOKEN)
+        remains, warehouse_ok = await get_warehouse_remains(WB_TOKEN)
+        if not warehouse_ok:
+            print("WARNING: Warehouse data failed — stock quantities will show as 0")
         print(f"Got {len(remains)} SKUs in stock")
 
-        # 4. Метрики за вчера
-        metrics = build_metrics_from_funnel(funnel, remains, report_date_str)
+        # 5. Метрики за вчера
+        metrics = build_metrics_from_stats(daily_stats, remains, report_date_str)
 
         if not metrics:
             send_telegram_error(
-                f"⚠️ WB отчёт: за {report_date_str} нет данных по артикулам.\n"
-                f"Sales Funnel вернул {len(funnel)} товаров, но за отчётную дату все orderCount=0.\n"
+                f"⚠️ WB отчёт: за {report_date_str} нет заказов.\n"
+                f"Statistics API вернул {len(stat_orders)} записей, но за отчётную дату заказов нет.\n"
                 f"Возможно, данные за вчера ещё не появились — попробуй запустить позже.",
                 TG_BOT_TOKEN, TG_CHAT_ID,
             )
@@ -932,12 +915,12 @@ async def main():
         total_cancels = sum(m.cancellations_today for m in metrics)
         total_revenue = sum(m.revenue_today for m in metrics)
 
-        print(f"Orders={total_orders} Sales={total_sales} Cancels={total_cancels} Revenue={total_revenue:.2f} ₽")
+        print(f"Orders={total_orders} Sales={total_sales} Cancels={total_cancels} Revenue={total_revenue:,.0f} ₽")
 
         # Сравнение вчера vs позавчера
-        today_summary, prev_summary = get_day_summaries(funnel, report_date_str)
+        today_summary, prev_summary = get_day_summaries_from_stats(daily_stats, report_date_str)
 
-        dates_7d, orders_7d, sales_7d = get_7day_trend_from_funnel(funnel, report_date_str)
+        dates_7d, orders_7d, sales_7d = get_7day_trend_from_stats(daily_stats, report_date_str)
 
         print("Building HTML report ...")
         html = build_html_report(
@@ -975,7 +958,7 @@ async def main():
 
     except Exception as e:
         print(f"Fatal error: {e}")
-        send_telegram_error(f"⚠️ WB отчёт не сформирован: {type(e).__name__}", TG_BOT_TOKEN, TG_CHAT_ID)
+        send_telegram_error(f"⚠️ WB отчёт не сформирован: {type(e).__name__}: {e}", TG_BOT_TOKEN, TG_CHAT_ID)
         raise
 
 
