@@ -152,131 +152,69 @@ async def get_sales_funnel(
     wb_token: str, date_from: str, date_to: str, nm_ids: List[int] = None
 ) -> List[FunnelProduct]:
     """
-    Получает статистику карточек из WB Analytics API.
-    Пробует два endpoint: nm-report/detail/history и sales-funnel/products/history.
+    Sales Funnel API — батчами по 20 nmIds.
+    Возвращает orderCount (штуки) и orderSum, совпадающие с кабинетом WB.
     """
-    # Попробовать оба endpoint — какой ответит, тот и используем
-    endpoints = [
-        {
-            "name": "nm-report/detail/history",
-            "url": f"{ANALYT_HOST}/api/v2/nm-report/detail/history",
-            "headers": {"Authorization": wb_token},
-            "body": {
-                "nmIDs": [],
-                "period": {"begin": f"{date_from} 00:00:00", "end": f"{date_to} 23:59:59"},
-                "timezone": "Europe/Moscow",
-                "page": 1,
-            },
-        },
-        {
-            "name": "sales-funnel/products/history",
-            "url": f"{ANALYT_HOST}/api/analytics/v3/sales-funnel/products/history",
-            "headers": {"Authorization": f"Bearer {wb_token}"},
-            "body": {
-                "selectedPeriod": {"start": date_from, "end": date_to},
-                "nmIds": nm_ids or [],
-                "skipDeletedNm": True,
-                "aggregationLevel": "day",
-            },
-        },
-    ]
+    headers = {"Authorization": f"Bearer {wb_token}"}
+    url = f"{ANALYT_HOST}/api/analytics/v3/sales-funnel/products/history"
+    results = []
+    errors = 0
+    batch_size = 20
+    ids = nm_ids or []
 
-    # Шаг 1: найти работающий endpoint
-    working_ep = None
-    for ep in endpoints:
-        try:
-            print(f"  Trying {ep['name']} ...")
-            resp = requests.post(ep["url"], headers=ep["headers"], json=ep["body"], timeout=30)
-            print(f"  {ep['name']}: HTTP {resp.status_code}")
-            if resp.status_code == 404:
-                print(f"  {ep['name']}: 404 — skipping")
-                continue
-            if resp.status_code == 401 or resp.status_code == 403:
-                print(f"  {ep['name']}: {resp.status_code} — auth failed")
-                print(f"  Response: {resp.text[:300]}")
-                continue
-            if resp.ok:
-                data = resp.json()
-                print(f"  {ep['name']}: OK! Response keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
-                print(f"  First 500 chars: {str(data)[:500]}")
-                working_ep = ep
-                break
-            else:
-                print(f"  {ep['name']}: HTTP {resp.status_code}")
-                print(f"  Response: {resp.text[:300]}")
-        except Exception as e:
-            print(f"  {ep['name']}: Exception: {e}")
-
-    if not working_ep:
-        print("No working analytics endpoint found!")
+    if not ids:
+        print("  No nmIds provided — skipping Sales Funnel")
         return []
 
-    print(f"\nUsing endpoint: {working_ep['name']}")
+    total_batches = (len(ids) + batch_size - 1) // batch_size
+    print(f"  {len(ids)} products, {total_batches} batches of {batch_size}")
 
-    # Шаг 2: загрузить данные через работающий endpoint
-    results = []
-    all_items_count = 0
+    for i in range(0, len(ids), batch_size):
+        batch = ids[i:i + batch_size]
+        batch_num = i // batch_size + 1
 
-    # Парсим первый ответ (уже получен)
-    first_data = data
-    page = 1
-
-    while True:
-        if page > 1:
+        if i > 0:
             await asyncio.sleep(6)
-            body = working_ep["body"].copy()
-            if "page" in body:
-                body["page"] = page
-            try:
-                resp = _request_with_retry(
-                    "POST", working_ep["url"], headers=working_ep["headers"],
-                    json=body, max_retries=5,
-                )
-                if not resp.ok:
-                    break
-                current_data = resp.json()
-            except Exception as e:
-                print(f"  [page {page}] Exception: {e}")
-                break
-        else:
-            current_data = first_data
 
-        # Извлекаем items — структура зависит от endpoint
-        items = _extract_items(current_data)
-        if not items:
-            if page == 1:
-                print(f"  No items in response")
-            break
+        body = {
+            "selectedPeriod": {"start": date_from, "end": date_to},
+            "nmIds": batch,
+            "skipDeletedNm": True,
+            "aggregationLevel": "day",
+        }
+        try:
+            resp = _request_with_retry(
+                "POST", url, headers=headers, json=body, max_retries=5,
+            )
+            print(f"  [batch {batch_num}/{total_batches}] HTTP {resp.status_code}")
 
-        all_items_count += len(items)
-        print(f"  [page {page}] {len(items)} items")
+            data = resp.json()
+            items = data.get("data", []) if isinstance(data, dict) else []
 
-        for item in items:
-            fp = _parse_funnel_item(item)
-            if fp:
-                results.append(fp)
+            # Детальный лог первого батча
+            if batch_num == 1:
+                print(f"  [batch 1] Response keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
+                if items:
+                    sample = items[0]
+                    print(f"  [batch 1] First item keys: {list(sample.keys())}")
+                    hist = sample.get("history", [])
+                    if hist:
+                        print(f"  [batch 1] History[0]: {hist[0]}")
+                else:
+                    print(f"  [batch 1] No items. Response: {str(data)[:500]}")
 
-        if len(items) < 100:
-            break
-        page += 1
-        if page > 10:
-            break
+            for item in items:
+                fp = _parse_funnel_item(item)
+                if fp:
+                    results.append(fp)
 
-    print(f"Analytics: {all_items_count} total items, {len(results)} with activity")
+        except Exception as e:
+            print(f"  [batch {batch_num}] Exception: {e}")
+            errors += 1
+
+    print(f"Sales Funnel: {len(results)} products with activity, {errors} errors")
     return results
 
-
-def _extract_items(data: dict) -> list:
-    """Извлекает список товаров из ответа API (разные форматы)."""
-    if not isinstance(data, dict):
-        return []
-    # nm-report: data.data[] или data.cards[]
-    items = data.get("data", data.get("cards", []))
-    if isinstance(items, dict):
-        items = items.get("cards", items.get("data", []))
-    if isinstance(items, list):
-        return items
-    return []
 
 
 def _parse_funnel_item(item: dict) -> Optional[FunnelProduct]:
