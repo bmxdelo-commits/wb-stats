@@ -1,9 +1,6 @@
 name: WB Daily Report
 
 on:
-  schedule:
-    # Каждый день в 09:00 МСК (= 06:00 UTC)
-    - cron: '0 6 * * *'
   workflow_dispatch:
     # Позволяет запустить вручную из интерфейса GitHub
 
